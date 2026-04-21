@@ -210,7 +210,7 @@ func (c *ServicesController) addServiceFunc(obj interface{}) {
 		// Object is not a Service.
 		return
 	}
-	if !hasWholeIPAnnotation(svc) {
+	if !isCozyProxyService(svc) {
 		return
 	}
 
@@ -266,8 +266,8 @@ func (c *ServicesController) updateServiceFunc(oldObj, newObj interface{}) {
 		return
 	}
 
-	// If the required annotation is missing, remove the service mapping and delete NAT rules if applicable.
-	if !hasWholeIPAnnotation(svc) {
+	// If the service no longer matches our selection criteria, remove the service mapping and delete NAT rules if applicable.
+	if !isCozyProxyService(svc) {
 		if se, exists := c.Services.Get(svc.Namespace, svc.Name); exists {
 			if hasValidServiceIP(se.Service) && hasValidEndpointIP(se.Endpoint) {
 				c.Proxy.DeleteRules(
@@ -447,10 +447,28 @@ func hasValidEndpointIP(ep *v1.Endpoints) bool {
 	return ep.Subsets[0].Addresses[0].IP != ""
 }
 
-// hasWholeIPAnnotation checks if the service has the wholeIP annotation set to true.
-func hasWholeIPAnnotation(svc *v1.Service) bool {
-	val, ok := svc.Annotations["networking.cozystack.io/wholeIP"]
-	return ok && val == "true"
+// wholeIPAnnotation marks a service for 1:1 NAT by cozy-proxy.
+const wholeIPAnnotation = "networking.cozystack.io/wholeIP"
+
+// serviceProxyNameLabel is the standard Kubernetes label used to delegate a service
+// to a non-default proxy implementation; kube-proxy skips services carrying it.
+const serviceProxyNameLabel = "service.kubernetes.io/service-proxy-name"
+
+// serviceProxyName is the value cozy-proxy matches in serviceProxyNameLabel.
+const serviceProxyName = "cozy-proxy"
+
+// isCozyProxyService reports whether the service should be managed by cozy-proxy.
+// A service is selected if it carries the service.kubernetes.io/service-proxy-name=cozy-proxy
+// label (standard Kubernetes mechanism, also tells kube-proxy to ignore the service)
+// or the legacy networking.cozystack.io/wholeIP=true annotation.
+func isCozyProxyService(svc *v1.Service) bool {
+	if svc == nil {
+		return false
+	}
+	if svc.Labels[serviceProxyNameLabel] == serviceProxyName {
+		return true
+	}
+	return svc.Annotations[wholeIPAnnotation] == "true"
 }
 
 // cleanupRemovedServices performs an initial cleanup for removed services.
