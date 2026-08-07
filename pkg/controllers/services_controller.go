@@ -267,12 +267,15 @@ func (c *ServicesController) Start(ctx context.Context) error {
 	}
 	log.Info("endpoints synchronization completed")
 
-	// Run cleanup for removed services.
+	// Run cleanup for removed services. A failure here is logged but does not
+	// abort: exiting takes the pod down and leaves the node's datapath
+	// half-programmed, whereas the informers below converge on the next event.
 	log.Info("running cleanup for removed services")
 	if err := c.cleanupRemovedServices(); err != nil {
-		return fmt.Errorf("failed to cleanup removed services: %w", err)
+		log.Error(err, "cleanup of removed services failed, continuing with reconciliation")
+	} else {
+		log.Info("cleanup of removed services completed")
 	}
-	log.Info("cleanup of removed services completed")
 
 	<-ctx.Done()
 	log.Info("shutting down services-controller")

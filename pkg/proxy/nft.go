@@ -527,6 +527,24 @@ func (p *NFTProxyProcessor) DeleteRules(svcIP, podIP string) error {
 	return nil
 }
 
+// flushTolerateENOENT commits the pending batch and treats ENOENT as success.
+//
+// Deleting a set element that is already gone reports ENOENT, which fails the
+// whole flush. Deletions must therefore be committed on their own, so a stale
+// element cannot mask a genuine failure among the additions that would
+// otherwise share the batch.
+func (p *NFTProxyProcessor) flushTolerateENOENT(op string) error {
+	err := p.conn.Flush()
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, unix.ENOENT) {
+		log.Info("Ignoring ENOENT on flush — element already gone", "op", op)
+		return nil
+	}
+	return err
+}
+
 // CleanupRules receives a keepMap (keys: svcIP, values: podIP) representing the desired state.
 // It recovers from an inconsistent state by:
 // 1. Removing any mappings in the pod_svc and svc_pod maps that do not match keepMap.
@@ -585,6 +603,13 @@ func (p *NFTProxyProcessor) CleanupRules(keepMap map[string]string) error {
 			log.Error(err, "Failed to delete inconsistent mappings from svc_pod")
 			return fmt.Errorf("failed to delete inconsistent mappings from svc_pod: %v", err)
 		}
+		// Commit the deletions before queueing the additions below: an element
+		// that is already gone fails the flush, and a shared batch would report
+		// that as a cleanup failure, which aborts the controller at startup.
+		if err := p.flushTolerateENOENT("CleanupRules deletions"); err != nil {
+			log.Error(err, "Failed to commit cleanup deletions")
+			return fmt.Errorf("failed to commit cleanup deletions: %v", err)
+		}
 		log.Info("Inconsistent mappings removed from both maps")
 	} else {
 		log.Info("No inconsistent mappings found in maps")
@@ -617,7 +642,10 @@ func (p *NFTProxyProcessor) CleanupRules(keepMap map[string]string) error {
 	}
 
 	// --- Final commit ---
-	if err := p.conn.Flush(); err != nil {
+	// Startup cleanup must not be fatal: aborting here takes the whole
+	// DaemonSet pod down and leaves the node's datapath half-programmed, while
+	// the reconcile loop would have converged on the next event anyway.
+	if err := p.flushTolerateENOENT("CleanupRules additions"); err != nil {
 		log.Error(err, "Failed to commit cleanup changes")
 		return fmt.Errorf("failed to commit cleanup changes: %v", err)
 	}
@@ -804,6 +832,13 @@ func (p *NFTProxyProcessor) CleanupPortFilters(keep map[string]PortFilterEntry) 
 			return fmt.Errorf("failed to delete stale allowed_ports: %v", err)
 		}
 	}
+	// Commit deletions separately so an element that is already gone cannot
+	// fail the batch carrying the additions below.
+	if len(delPods) > 0 || len(delPorts) > 0 {
+		if err := p.flushTolerateENOENT("CleanupPortFilters deletions"); err != nil {
+			return fmt.Errorf("failed to flush CleanupPortFilters deletions: %v", err)
+		}
+	}
 	if len(addPods) > 0 {
 		if err := p.conn.SetAddElements(p.filteredPods, addPods); err != nil {
 			return fmt.Errorf("failed to add filtered_pods: %v", err)
@@ -815,8 +850,8 @@ func (p *NFTProxyProcessor) CleanupPortFilters(keep map[string]PortFilterEntry) 
 		}
 	}
 
-	// 5. Single flush.
-	if err := p.conn.Flush(); err != nil {
+	// 5. Commit the additions. Startup cleanup must not abort the pod.
+	if err := p.flushTolerateENOENT("CleanupPortFilters additions"); err != nil {
 		return fmt.Errorf("failed to flush CleanupPortFilters: %v", err)
 	}
 	log.Info("CleanupPortFilters completed",
@@ -948,6 +983,10 @@ func (p *NFTProxyProcessor) CleanupICMPAllow(keep map[string]string) error {
 		if err := p.conn.SetDeleteElements(p.icmpAllowedPods, delPods); err != nil {
 			return fmt.Errorf("failed to delete stale icmp_allowed_pods: %v", err)
 		}
+		// Commit deletions separately: see flushTolerateENOENT.
+		if err := p.flushTolerateENOENT("CleanupICMPAllow deletions"); err != nil {
+			return fmt.Errorf("failed to flush CleanupICMPAllow deletions: %v", err)
+		}
 	}
 	if len(addPods) > 0 {
 		if err := p.conn.SetAddElements(p.icmpAllowedPods, addPods); err != nil {
@@ -955,7 +994,7 @@ func (p *NFTProxyProcessor) CleanupICMPAllow(keep map[string]string) error {
 		}
 	}
 
-	if err := p.conn.Flush(); err != nil {
+	if err := p.flushTolerateENOENT("CleanupICMPAllow additions"); err != nil {
 		return fmt.Errorf("failed to flush CleanupICMPAllow: %v", err)
 	}
 	log.Info("CleanupICMPAllow completed",
