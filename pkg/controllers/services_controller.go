@@ -96,6 +96,83 @@ type ServicesController struct {
 	Clientset *kubernetes.Clientset
 	Services  *ServiceMap
 	Proxy     nat.ProxyProcessor
+
+	// NodeName is the node this instance runs on. Datapath rules are only
+	// programmed for backend pods hosted here. Empty disables the check and
+	// restores the previous cluster-wide behavior.
+	NodeName string
+}
+
+// endpointNode returns the node hosting the endpoint's first address.
+func endpointNode(ep *v1.Endpoints) (string, bool) {
+	if !hasValidEndpointIP(ep) {
+		return "", false
+	}
+	node := ep.Subsets[0].Addresses[0].NodeName
+	if node == nil || *node == "" {
+		return "", false
+	}
+	return *node, true
+}
+
+// servesEndpoint reports whether this node must program datapath rules for ep.
+//
+// The rules are node-local: only the node hosting the backend pod may rewrite
+// the service IP. Programming them cluster-wide makes a non-owning node
+// translate the destination before the packet even leaves it, so the owning
+// node records a conntrack tuple the SNATed reply can no longer match, and
+// port_filter drops that reply.
+//
+// When the node name is unknown (NODE_NAME not injected, or an endpoint
+// carrying no NodeName) the rules are programmed anyway, so an older chart
+// keeps the previous behavior instead of silently losing the datapath.
+func (c *ServicesController) servesEndpoint(ep *v1.Endpoints) bool {
+	if c.NodeName == "" {
+		return true
+	}
+	node, ok := endpointNode(ep)
+	if !ok {
+		return true
+	}
+	return node == c.NodeName
+}
+
+// applyRules programs the datapath for a (service, endpoint) pair when this
+// node hosts the backend pod, and withdraws it otherwise. Both objects must
+// already have been checked with hasValidServiceIP/hasValidEndpointIP.
+func (c *ServicesController) applyRules(svc *v1.Service, ep *v1.Endpoints, ctx string) {
+	svcIP := svc.Status.LoadBalancer.Ingress[0].IP
+	podIP := ep.Subsets[0].Addresses[0].IP
+
+	if !c.servesEndpoint(ep) {
+		c.withdrawRules(svcIP, podIP, ctx+" (backend not on this node)")
+		return
+	}
+
+	c.Proxy.EnsureRules(svcIP, podIP)
+	c.reconcilePortFilter(svc, svcIP, podIP, ctx)
+}
+
+// withdrawRules removes every datapath entry for the pair. Absent entries are
+// not an error.
+func (c *ServicesController) withdrawRules(svcIP, podIP, ctx string) {
+	c.clearPortFilter(svcIP, podIP, ctx)
+	c.Proxy.DeleteRules(svcIP, podIP)
+}
+
+// withdrawStaleEndpoint drops the rules of a previous endpoint whose pod IP no
+// longer matches the current one, which is what happens when a VM is migrated
+// to another node. Without this the old node keeps a mapping for a pod it no
+// longer hosts.
+func (c *ServicesController) withdrawStaleEndpoint(svc *v1.Service, prev *v1.Endpoints, podIP, ctx string) {
+	if !hasValidServiceIP(svc) || !hasValidEndpointIP(prev) {
+		return
+	}
+	prevPodIP := prev.Subsets[0].Addresses[0].IP
+	if prevPodIP == podIP {
+		return
+	}
+	c.withdrawRules(svc.Status.LoadBalancer.Ingress[0].IP, prevPodIP, ctx+" (stale endpoint)")
 }
 
 // Start initializes the NAT, runs the service and endpoint informers, and cleans up removed services.
@@ -231,11 +308,7 @@ func (c *ServicesController) addServiceFunc(obj interface{}) {
 	if err == nil && ep != nil && hasValidEndpointIP(ep) && hasValidServiceIP(svc) {
 		se.Endpoint = ep
 		c.Services.Set(svc.Namespace, svc.Name, se)
-		svcIP := svc.Status.LoadBalancer.Ingress[0].IP
-		podIP := ep.Subsets[0].Addresses[0].IP
-		// Ensure NAT mapping rules are set.
-		c.Proxy.EnsureRules(svcIP, podIP)
-		c.reconcilePortFilter(svc, svcIP, podIP, "on svc add")
+		c.applyRules(svc, ep, "on svc add")
 	}
 }
 
@@ -330,10 +403,10 @@ func (c *ServicesController) updateServiceFunc(oldObj, newObj interface{}) {
 
 	// At this point, both the Service and Endpoint have valid IPs.
 	// Ensure NAT mapping is up-to-date.
-	svcIP := svc.Status.LoadBalancer.Ingress[0].IP
-	podIP := ep.Subsets[0].Addresses[0].IP
-	c.Proxy.EnsureRules(svcIP, podIP)
-	c.reconcilePortFilter(svc, svcIP, podIP, "on svc update")
+	if se, exists := c.Services.Get(svc.Namespace, svc.Name); exists {
+		c.withdrawStaleEndpoint(svc, se.Endpoint, ep.Subsets[0].Addresses[0].IP, "on svc update")
+	}
+	c.applyRules(svc, ep, "on svc update")
 
 	// Update or add the service mapping with the new endpoint.
 	c.Services.Set(svc.Namespace, svc.Name, &ServiceEndpoints{Service: svc, Endpoint: ep})
@@ -360,10 +433,8 @@ func (c *ServicesController) addEndpointFunc(obj interface{}) {
 
 	// If both the Service and the Endpoint have valid IPs, ensure NAT mapping rules.
 	if hasValidServiceIP(se.Service) && hasValidEndpointIP(ep) {
-		svcIP := se.Service.Status.LoadBalancer.Ingress[0].IP
-		podIP := ep.Subsets[0].Addresses[0].IP
-		c.Proxy.EnsureRules(svcIP, podIP)
-		c.reconcilePortFilter(se.Service, svcIP, podIP, "on endpoint add")
+		c.withdrawStaleEndpoint(se.Service, se.Endpoint, ep.Subsets[0].Addresses[0].IP, "on endpoint add")
+		c.applyRules(se.Service, ep, "on endpoint add")
 	}
 }
 
@@ -420,10 +491,8 @@ func (c *ServicesController) updateEndpointFunc(oldObj, newObj interface{}) {
 	if !hasValidEndpointIP(ep) {
 		return
 	}
-	svcIP := se.Service.Status.LoadBalancer.Ingress[0].IP
-	podIP := ep.Subsets[0].Addresses[0].IP
-	c.Proxy.EnsureRules(svcIP, podIP)
-	c.reconcilePortFilter(se.Service, svcIP, podIP, "on endpoint update")
+	c.withdrawStaleEndpoint(se.Service, se.Endpoint, ep.Subsets[0].Addresses[0].IP, "on endpoint update")
+	c.applyRules(se.Service, ep, "on endpoint update")
 	c.Services.SetEndpoint(ep.Namespace, ep.Name, ep)
 }
 
@@ -555,6 +624,13 @@ func (c *ServicesController) cleanupRemovedServices() error {
 		if serviceEndpoints.Service != nil && serviceEndpoints.Endpoint != nil {
 			var serviceIP, endpointIP string
 
+			// Backends hosted elsewhere are not ours to program, so they must
+			// not be kept: this is what purges entries inherited from a build
+			// that programmed every service on every node.
+			if !c.servesEndpoint(serviceEndpoints.Endpoint) {
+				continue
+			}
+
 			if len(serviceEndpoints.Service.Status.LoadBalancer.Ingress) > 0 {
 				serviceIP = serviceEndpoints.Service.Status.LoadBalancer.Ingress[0].IP
 			}
@@ -582,7 +658,7 @@ func (c *ServicesController) cleanupRemovedServices() error {
 		if !hasValidServiceIP(se.Service) || !hasValidEndpointIP(se.Endpoint) {
 			continue
 		}
-		if wholeIPPassthrough(se.Service) {
+		if wholeIPPassthrough(se.Service) || !c.servesEndpoint(se.Endpoint) {
 			continue
 		}
 		keepFilters[se.Service.Status.LoadBalancer.Ingress[0].IP] = nat.PortFilterEntry{
@@ -603,7 +679,7 @@ func (c *ServicesController) cleanupRemovedServices() error {
 		if !hasValidServiceIP(se.Service) || !hasValidEndpointIP(se.Endpoint) {
 			continue
 		}
-		if wholeIPPassthrough(se.Service) || !allowICMP(se.Service) {
+		if wholeIPPassthrough(se.Service) || !allowICMP(se.Service) || !c.servesEndpoint(se.Endpoint) {
 			continue
 		}
 		keepICMP[se.Service.Status.LoadBalancer.Ingress[0].IP] = se.Endpoint.Subsets[0].Addresses[0].IP
