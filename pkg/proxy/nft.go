@@ -387,144 +387,156 @@ func (p *NFTProxyProcessor) InitRules() error {
 	return nil
 }
 
-// EnsureRules ensures that a one-to-one mapping exists between svcIP and podIP.
-// If a mapping already exists for svcIP with a different podIP,
-// the old mapping is removed (from svc_pod, pod_svc, and from the raw pod set)
-// before the new mapping is added.
-func (p *NFTProxyProcessor) EnsureRules(svcIP, podIP string) error {
-	log.Info("Ensuring NAT mapping", "svcIP", svcIP, "podIP", podIP)
+// EnsureEgressSNAT adds the pod_svc entry (podIP → svcIP) consulted by the
+// egress_snat chain. If podIP is already mapped to another service, that stale
+// entry is dropped first: a pod IP can only stand for one service IP.
+//
+// Programmed on every node, see ProxyProcessor.EnsureEgressSNAT.
+func (p *NFTProxyProcessor) EnsureEgressSNAT(svcIP, podIP string) error {
+	log.Info("Ensuring egress SNAT", "svcIP", svcIP, "podIP", podIP)
 
-	parsedSvcIP := net.ParseIP(svcIP).To4()
-	if parsedSvcIP == nil {
-		return fmt.Errorf("invalid svcIP: %s", svcIP)
-	}
-	parsedPodIP := net.ParseIP(podIP).To4()
-	if parsedPodIP == nil {
-		return fmt.Errorf("invalid podIP: %s", podIP)
-	}
-
-	// --- Remove conflicting mapping for svcIP in svc_pod map ---
-	// If svcIP already maps to a different pod, remove that mapping and
-	// delete the old pod from the raw pod set.
-	svcPodElems, err := p.conn.GetSetElements(p.svcPodMap)
+	parsedSvcIP, parsedPodIP, err := parsePair(svcIP, podIP)
 	if err != nil {
-		log.Error(err, "Failed to get svc_pod map elements")
-		return fmt.Errorf("failed to get svc_pod map elements: %v", err)
-	}
-	for _, el := range svcPodElems {
-		if bytes.Equal(el.Key, parsedSvcIP) {
-			// Found an existing mapping for svcIP.
-			if !bytes.Equal(el.Val, parsedPodIP) {
-				oldPodIP := el.Val
-				log.Info("Updating mapping for svc", "svcIP", svcIP, "oldPodIP", net.IP(oldPodIP).String(), "newPodIP", podIP)
-				// Remove the old mapping from svc_pod.
-				if err := p.conn.SetDeleteElements(p.svcPodMap, []nftables.SetElement{{Key: parsedSvcIP, Val: oldPodIP}}); err != nil {
-					log.Error(err, "Failed to delete old svc_pod mapping", "svcIP", svcIP, "oldPodIP", net.IP(oldPodIP).String())
-					return fmt.Errorf("failed to delete old svc_pod mapping: %v", err)
-				}
-				// Remove the corresponding mapping from pod_svc.
-				if err := p.conn.SetDeleteElements(p.podSvcMap, []nftables.SetElement{{Key: oldPodIP, Val: parsedSvcIP}}); err != nil {
-					log.Error(err, "Failed to delete corresponding pod_svc mapping", "oldPodIP", net.IP(oldPodIP).String(), "svcIP", svcIP)
-					return fmt.Errorf("failed to delete corresponding pod_svc mapping: %v", err)
-				}
-			}
-			break // svcIP mapping handled; exit loop.
-		}
+		return err
 	}
 
-	// --- Remove conflicting mapping for podIP in pod_svc map ---
-	// If podIP already maps to a different svc, remove that mapping and delete the podIP
-	// from the raw pod set (since the old mapping is no longer desired).
 	podSvcElems, err := p.conn.GetSetElements(p.podSvcMap)
 	if err != nil {
 		log.Error(err, "Failed to get pod_svc map elements")
 		return fmt.Errorf("failed to get pod_svc map elements: %v", err)
 	}
 	for _, el := range podSvcElems {
-		if bytes.Equal(el.Key, parsedPodIP) {
-			// Found an existing mapping for podIP.
-			if !bytes.Equal(el.Val, parsedSvcIP) {
-				log.Info("Updating mapping for pod", "podIP", podIP, "oldSvcIP", net.IP(el.Val).String(), "newSvcIP", svcIP)
-				// Remove the old mapping from pod_svc.
-				if err := p.conn.SetDeleteElements(p.podSvcMap, []nftables.SetElement{{Key: parsedPodIP, Val: el.Val}}); err != nil {
-					log.Error(err, "Failed to delete old pod_svc mapping", "podIP", podIP, "oldSvcIP", net.IP(el.Val).String())
-					return fmt.Errorf("failed to delete old pod_svc mapping: %v", err)
-				}
-				// Remove the corresponding mapping from svc_pod.
-				if err := p.conn.SetDeleteElements(p.svcPodMap, []nftables.SetElement{{Key: el.Val, Val: parsedPodIP}}); err != nil {
-					log.Error(err, "Failed to delete corresponding svc_pod mapping", "oldSvcIP", net.IP(el.Val).String(), "podIP", podIP)
-					return fmt.Errorf("failed to delete corresponding svc_pod mapping: %v", err)
-				}
-			}
-			break // podIP mapping handled; exit loop.
+		if !bytes.Equal(el.Key, parsedPodIP) {
+			continue
 		}
+		if !bytes.Equal(el.Val, parsedSvcIP) {
+			log.Info("Updating egress SNAT for pod", "podIP", podIP,
+				"oldSvcIP", net.IP(el.Val).String(), "newSvcIP", svcIP)
+			if err := p.conn.SetDeleteElements(p.podSvcMap, []nftables.SetElement{{Key: parsedPodIP, Val: el.Val}}); err != nil {
+				log.Error(err, "Failed to delete stale pod_svc mapping", "podIP", podIP)
+				return fmt.Errorf("failed to delete stale pod_svc mapping: %v", err)
+			}
+		}
+		break
 	}
 
-	// --- Add the new mapping to both maps ---
 	if err := p.conn.SetAddElements(p.podSvcMap, []nftables.SetElement{{Key: parsedPodIP, Val: parsedSvcIP}}); err != nil {
 		log.Error(err, "Failed to add mapping to pod_svc", "podIP", podIP, "svcIP", svcIP)
 		return fmt.Errorf("failed to add mapping to pod_svc: %v", err)
 	}
-	if err := p.conn.SetAddElements(p.svcPodMap, []nftables.SetElement{{Key: parsedSvcIP, Val: parsedPodIP}}); err != nil {
-		log.Error(err, "Failed to add mapping to svc_pod", "svcIP", svcIP, "podIP", podIP)
-		return fmt.Errorf("failed to add mapping to svc_pod: %v", err)
-	}
-	log.Info("Added mapping", "svcIP", svcIP, "podIP", podIP)
-
-	// Commit all changes.
 	if err := p.conn.Flush(); err != nil {
-		log.Error(err, "Failed to commit EnsureNAT changes")
-		return fmt.Errorf("failed to commit EnsureNAT changes: %v", err)
+		log.Error(err, "Failed to commit egress SNAT changes")
+		return fmt.Errorf("failed to commit egress SNAT changes: %v", err)
 	}
-	log.Info("NAT mapping ensured successfully", "svcIP", svcIP, "podIP", podIP)
+	log.Info("Egress SNAT ensured successfully", "svcIP", svcIP, "podIP", podIP)
 	return nil
 }
 
-// DeleteRules removes the mapping for the given svcIP and podIP from both maps
-// and commits the removal from NAT translation maps.
-func (p *NFTProxyProcessor) DeleteRules(svcIP, podIP string) error {
-	log.Info("Deleting NAT mapping", "svcIP", svcIP, "podIP", podIP)
+// DeleteEgressSNAT removes the pod_svc entry for the pair. An entry that is
+// already gone is not an error.
+func (p *NFTProxyProcessor) DeleteEgressSNAT(svcIP, podIP string) error {
+	log.Info("Deleting egress SNAT", "svcIP", svcIP, "podIP", podIP)
 
-	// Parse svcIP and podIP into IPv4 byte slices.
-	parsedSvcIP := net.ParseIP(svcIP).To4()
-	if parsedSvcIP == nil {
-		return fmt.Errorf("invalid svcIP: %s", svcIP)
-	}
-	parsedPodIP := net.ParseIP(podIP).To4()
-	if parsedPodIP == nil {
-		return fmt.Errorf("invalid podIP: %s", podIP)
+	parsedSvcIP, parsedPodIP, err := parsePair(svcIP, podIP)
+	if err != nil {
+		return err
 	}
 
-	// Delete mapping from the "pod_svc" map.
 	if err := p.conn.SetDeleteElements(p.podSvcMap, []nftables.SetElement{
 		{Key: parsedPodIP, Val: parsedSvcIP},
 	}); err != nil {
 		log.Error(err, "Failed to delete mapping from pod_svc", "podIP", podIP, "svcIP", svcIP)
 		return fmt.Errorf("failed to delete mapping from pod_svc: %v", err)
 	}
+	if err := p.flushTolerateENOENT("DeleteEgressSNAT"); err != nil {
+		log.Error(err, "Failed to commit egress SNAT deletion")
+		return fmt.Errorf("failed to commit egress SNAT deletion: %v", err)
+	}
+	log.Info("Egress SNAT deleted successfully", "svcIP", svcIP, "podIP", podIP)
+	return nil
+}
 
-	// Delete mapping from the "svc_pod" map.
+// EnsureIngressDNAT adds the svc_pod entry (svcIP → podIP) consulted by the
+// ingress_dnat chain. If svcIP is already mapped to another pod — a migrated
+// VM, a replaced backend — that stale entry is dropped first.
+//
+// Programmed only by the node hosting the backend, see
+// ProxyProcessor.EnsureIngressDNAT.
+func (p *NFTProxyProcessor) EnsureIngressDNAT(svcIP, podIP string) error {
+	log.Info("Ensuring ingress DNAT", "svcIP", svcIP, "podIP", podIP)
+
+	parsedSvcIP, parsedPodIP, err := parsePair(svcIP, podIP)
+	if err != nil {
+		return err
+	}
+
+	svcPodElems, err := p.conn.GetSetElements(p.svcPodMap)
+	if err != nil {
+		log.Error(err, "Failed to get svc_pod map elements")
+		return fmt.Errorf("failed to get svc_pod map elements: %v", err)
+	}
+	for _, el := range svcPodElems {
+		if !bytes.Equal(el.Key, parsedSvcIP) {
+			continue
+		}
+		if !bytes.Equal(el.Val, parsedPodIP) {
+			log.Info("Updating ingress DNAT for svc", "svcIP", svcIP,
+				"oldPodIP", net.IP(el.Val).String(), "newPodIP", podIP)
+			if err := p.conn.SetDeleteElements(p.svcPodMap, []nftables.SetElement{{Key: parsedSvcIP, Val: el.Val}}); err != nil {
+				log.Error(err, "Failed to delete stale svc_pod mapping", "svcIP", svcIP)
+				return fmt.Errorf("failed to delete stale svc_pod mapping: %v", err)
+			}
+		}
+		break
+	}
+
+	if err := p.conn.SetAddElements(p.svcPodMap, []nftables.SetElement{{Key: parsedSvcIP, Val: parsedPodIP}}); err != nil {
+		log.Error(err, "Failed to add mapping to svc_pod", "svcIP", svcIP, "podIP", podIP)
+		return fmt.Errorf("failed to add mapping to svc_pod: %v", err)
+	}
+	if err := p.conn.Flush(); err != nil {
+		log.Error(err, "Failed to commit ingress DNAT changes")
+		return fmt.Errorf("failed to commit ingress DNAT changes: %v", err)
+	}
+	log.Info("Ingress DNAT ensured successfully", "svcIP", svcIP, "podIP", podIP)
+	return nil
+}
+
+// DeleteIngressDNAT removes the svc_pod entry for the pair. An entry that is
+// already gone is not an error.
+func (p *NFTProxyProcessor) DeleteIngressDNAT(svcIP, podIP string) error {
+	log.Info("Deleting ingress DNAT", "svcIP", svcIP, "podIP", podIP)
+
+	parsedSvcIP, parsedPodIP, err := parsePair(svcIP, podIP)
+	if err != nil {
+		return err
+	}
+
 	if err := p.conn.SetDeleteElements(p.svcPodMap, []nftables.SetElement{
 		{Key: parsedSvcIP, Val: parsedPodIP},
 	}); err != nil {
 		log.Error(err, "Failed to delete mapping from svc_pod", "svcIP", svcIP, "podIP", podIP)
 		return fmt.Errorf("failed to delete mapping from svc_pod: %v", err)
 	}
-
-	// Commit all changes.
-	if err := p.conn.Flush(); err != nil {
-		// Check if the error is ENOENT (no such file or directory) and ignore it.
-		// This may happen if the elements or even the table were already removed.
-		if errors.Is(err, unix.ENOENT) {
-			log.Info("Ignoring ENOENT error during flush in DeleteRules", "error", err)
-		} else {
-			log.Error(err, "Failed to commit DeleteNAT changes")
-			return fmt.Errorf("failed to commit DeleteNAT changes: %v", err)
-		}
+	if err := p.flushTolerateENOENT("DeleteIngressDNAT"); err != nil {
+		log.Error(err, "Failed to commit ingress DNAT deletion")
+		return fmt.Errorf("failed to commit ingress DNAT deletion: %v", err)
 	}
-
-	log.Info("NAT mapping and raw set elements deleted successfully", "svcIP", svcIP, "podIP", podIP)
+	log.Info("Ingress DNAT deleted successfully", "svcIP", svcIP, "podIP", podIP)
 	return nil
+}
+
+// parsePair validates a (svcIP, podIP) pair and returns both as IPv4 bytes.
+func parsePair(svcIP, podIP string) (net.IP, net.IP, error) {
+	parsedSvcIP := net.ParseIP(svcIP).To4()
+	if parsedSvcIP == nil {
+		return nil, nil, fmt.Errorf("invalid svcIP: %s", svcIP)
+	}
+	parsedPodIP := net.ParseIP(podIP).To4()
+	if parsedPodIP == nil {
+		return nil, nil, fmt.Errorf("invalid podIP: %s", podIP)
+	}
+	return parsedSvcIP, parsedPodIP, nil
 }
 
 // flushTolerateENOENT commits the pending batch and treats ENOENT as success.
@@ -545,103 +557,77 @@ func (p *NFTProxyProcessor) flushTolerateENOENT(op string) error {
 	return err
 }
 
-// CleanupRules receives a keepMap (keys: svcIP, values: podIP) representing the desired state.
-// It recovers from an inconsistent state by:
-// 1. Removing any mappings in the pod_svc and svc_pod maps that do not match keepMap.
-// 2. Adding any missing mappings from keepMap into both maps.
-// 3. Cleaning up the raw sets (pod and svc) so that only the desired IPs remain.
-func (p *NFTProxyProcessor) CleanupRules(keepMap map[string]string) error {
-	log.Info("Starting CleanupRules", "keepMap", keepMap)
+// CleanupRules reconciles both NAT maps against the desired state.
+//
+// keepEgress and keepIngress both map service IP → pod IP. They differ in
+// scope, which is the whole point: pod_svc must carry every managed service so
+// a reply reaching this node over the overlay still gets its source rewritten,
+// while svc_pod must carry only the backends hosted here so no other node
+// translates a destination before the packet has left.
+//
+// Anything present in a map but absent from its keep set is removed, which is
+// what purges state inherited from a build that scoped the two maps alike.
+func (p *NFTProxyProcessor) CleanupRules(keepEgress, keepIngress map[string]string) error {
+	log.Info("Starting CleanupRules", "keepEgress", keepEgress, "keepIngress", keepIngress)
 
-	// --- Step 1: Clean up mapping sets ---
+	// --- Step 1: collect what has to change in both maps ---
 
-	// Retrieve current mappings from the pod_svc map.
-	// Note: pod_svc maps pod IP → svc IP.
-	podSvcElems, err := p.conn.GetSetElements(p.podSvcMap)
+	// pod_svc is keyed by pod IP, so the desired state is keepEgress inverted.
+	desiredPodSvc := make(map[string]string, len(keepEgress)) // pod → svc
+	for svc, pod := range keepEgress {
+		desiredPodSvc[pod] = svc
+	}
+
+	podSvcDel, podSvcAdd, err := p.diffMap(p.podSvcMap, desiredPodSvc)
 	if err != nil {
-		log.Error(err, "Failed to get pod_svc elements")
-		return fmt.Errorf("failed to get pod_svc elements: %v", err)
+		return fmt.Errorf("failed to diff pod_svc: %v", err)
+	}
+	svcPodDel, svcPodAdd, err := p.diffMap(p.svcPodMap, keepIngress)
+	if err != nil {
+		return fmt.Errorf("failed to diff svc_pod: %v", err)
 	}
 
-	// Build a current mapping in svc->pod direction (for easy comparison with keepMap)
-	currentMapping := make(map[string]string) // key: svc, value: pod
-	for _, el := range podSvcElems {
-		pod := net.IP(el.Key).String()
-		svc := net.IP(el.Val).String()
-		currentMapping[svc] = pod
-	}
-
-	// Prepare slices for elements to delete from both maps.
-	var toDeletePodSvc []nftables.SetElement
-	var toDeleteSvcPod []nftables.SetElement
-
-	// For each mapping found in the current configuration, if it does not match the desired state, mark it for deletion.
-	for svc, pod := range currentMapping {
-		if expectedPod, ok := keepMap[svc]; !ok || expectedPod != pod {
-			log.Info("Marking inconsistent mapping for deletion", "svcIP", svc, "podIP", pod)
-			// Prepare deletion elements.
-			// pod_svc: key = pod, val = svc.
-			toDeletePodSvc = append(toDeletePodSvc, nftables.SetElement{
-				Key: net.ParseIP(pod).To4(),
-				Val: net.ParseIP(svc).To4(),
-			})
-			// svc_pod: key = svc, val = pod.
-			toDeleteSvcPod = append(toDeleteSvcPod, nftables.SetElement{
-				Key: net.ParseIP(svc).To4(),
-				Val: net.ParseIP(pod).To4(),
-			})
+	// --- Step 2: commit the deletions on their own ---
+	//
+	// An element that is already gone fails the flush, and a shared batch
+	// would report that as a cleanup failure, aborting the controller at
+	// startup.
+	if len(podSvcDel) > 0 || len(svcPodDel) > 0 {
+		if len(podSvcDel) > 0 {
+			if err := p.conn.SetDeleteElements(p.podSvcMap, podSvcDel); err != nil {
+				log.Error(err, "Failed to delete stale mappings from pod_svc")
+				return fmt.Errorf("failed to delete stale mappings from pod_svc: %v", err)
+			}
 		}
-	}
-
-	// Delete any inconsistent mappings.
-	if len(toDeletePodSvc) > 0 {
-		if err := p.conn.SetDeleteElements(p.podSvcMap, toDeletePodSvc); err != nil {
-			log.Error(err, "Failed to delete inconsistent mappings from pod_svc")
-			return fmt.Errorf("failed to delete inconsistent mappings from pod_svc: %v", err)
+		if len(svcPodDel) > 0 {
+			if err := p.conn.SetDeleteElements(p.svcPodMap, svcPodDel); err != nil {
+				log.Error(err, "Failed to delete stale mappings from svc_pod")
+				return fmt.Errorf("failed to delete stale mappings from svc_pod: %v", err)
+			}
 		}
-		if err := p.conn.SetDeleteElements(p.svcPodMap, toDeleteSvcPod); err != nil {
-			log.Error(err, "Failed to delete inconsistent mappings from svc_pod")
-			return fmt.Errorf("failed to delete inconsistent mappings from svc_pod: %v", err)
-		}
-		// Commit the deletions before queueing the additions below: an element
-		// that is already gone fails the flush, and a shared batch would report
-		// that as a cleanup failure, which aborts the controller at startup.
 		if err := p.flushTolerateENOENT("CleanupRules deletions"); err != nil {
 			log.Error(err, "Failed to commit cleanup deletions")
 			return fmt.Errorf("failed to commit cleanup deletions: %v", err)
 		}
-		log.Info("Inconsistent mappings removed from both maps")
+		log.Info("Stale mappings removed", "podSvc", len(podSvcDel), "svcPod", len(svcPodDel))
 	} else {
-		log.Info("No inconsistent mappings found in maps")
+		log.Info("No stale mappings found in maps")
 	}
 
-	// --- Step 2: Add missing mappings from keepMap ---
-
-	// For every desired mapping in keepMap, ensure it exists in both maps.
-	for svc, pod := range keepMap {
-		// Check if the current mapping for svc exists and matches.
-		if existingPod, ok := currentMapping[svc]; !ok || existingPod != pod {
-			parsedSvcIP := net.ParseIP(svc).To4()
-			parsedPodIP := net.ParseIP(pod).To4()
-			if parsedSvcIP == nil || parsedPodIP == nil {
-				log.Error(nil, "Invalid IP in keepMap", "svcIP", svc, "podIP", pod)
-				continue
-			}
-			// Add mapping to pod_svc (pod → svc)
-			if err := p.conn.SetAddElements(p.podSvcMap, []nftables.SetElement{{Key: parsedPodIP, Val: parsedSvcIP}}); err != nil {
-				log.Error(err, "Failed to add missing mapping to pod_svc", "podIP", pod, "svcIP", svc)
-				return fmt.Errorf("failed to add missing mapping to pod_svc: %v", err)
-			}
-			// Add mapping to svc_pod (svc → pod)
-			if err := p.conn.SetAddElements(p.svcPodMap, []nftables.SetElement{{Key: parsedSvcIP, Val: parsedPodIP}}); err != nil {
-				log.Error(err, "Failed to add missing mapping to svc_pod", "svcIP", svc, "podIP", pod)
-				return fmt.Errorf("failed to add missing mapping to svc_pod: %v", err)
-			}
-			log.Info("Added missing mapping", "svcIP", svc, "podIP", pod)
+	// --- Step 3: add whatever is missing ---
+	if len(podSvcAdd) > 0 {
+		if err := p.conn.SetAddElements(p.podSvcMap, podSvcAdd); err != nil {
+			log.Error(err, "Failed to add missing mappings to pod_svc")
+			return fmt.Errorf("failed to add missing mappings to pod_svc: %v", err)
+		}
+	}
+	if len(svcPodAdd) > 0 {
+		if err := p.conn.SetAddElements(p.svcPodMap, svcPodAdd); err != nil {
+			log.Error(err, "Failed to add missing mappings to svc_pod")
+			return fmt.Errorf("failed to add missing mappings to svc_pod: %v", err)
 		}
 	}
 
-	// --- Final commit ---
 	// Startup cleanup must not be fatal: aborting here takes the whole
 	// DaemonSet pod down and leaves the node's datapath half-programmed, while
 	// the reconcile loop would have converged on the next event anyway.
@@ -649,8 +635,46 @@ func (p *NFTProxyProcessor) CleanupRules(keepMap map[string]string) error {
 		log.Error(err, "Failed to commit cleanup changes")
 		return fmt.Errorf("failed to commit cleanup changes: %v", err)
 	}
-	log.Info("CleanupRules completed successfully")
+	log.Info("CleanupRules completed successfully",
+		"podSvcAdded", len(podSvcAdd), "svcPodAdded", len(svcPodAdd))
 	return nil
+}
+
+// diffMap compares one nft map against its desired state and returns the
+// elements to delete and to add. Both the map and desired are read in the
+// map's own key → value direction.
+func (p *NFTProxyProcessor) diffMap(m *nftables.Set, desired map[string]string) (del, add []nftables.SetElement, err error) {
+	elems, err := p.conn.GetSetElements(m)
+	if err != nil {
+		log.Error(err, "Failed to get map elements", "map", m.Name)
+		return nil, nil, fmt.Errorf("failed to get %s elements: %v", m.Name, err)
+	}
+
+	current := make(map[string]string, len(elems))
+	for _, el := range elems {
+		key := net.IP(el.Key).String()
+		val := net.IP(el.Val).String()
+		current[key] = val
+		if want, ok := desired[key]; !ok || want != val {
+			log.Info("Marking stale mapping for deletion", "map", m.Name, "key", key, "value", val)
+			del = append(del, nftables.SetElement{Key: el.Key, Val: el.Val})
+		}
+	}
+
+	for key, val := range desired {
+		if cur, ok := current[key]; ok && cur == val {
+			continue
+		}
+		parsedKey := net.ParseIP(key).To4()
+		parsedVal := net.ParseIP(val).To4()
+		if parsedKey == nil || parsedVal == nil {
+			log.Error(nil, "Invalid IP in desired state", "map", m.Name, "key", key, "value", val)
+			continue
+		}
+		log.Info("Adding missing mapping", "map", m.Name, "key", key, "value", val)
+		add = append(add, nftables.SetElement{Key: parsedKey, Val: parsedVal})
+	}
+	return del, add, nil
 }
 
 // EnsurePortFilter installs ingress port filtering rules for the given

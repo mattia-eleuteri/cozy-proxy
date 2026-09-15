@@ -97,9 +97,10 @@ type ServicesController struct {
 	Services  *ServiceMap
 	Proxy     nat.ProxyProcessor
 
-	// NodeName is the node this instance runs on. Datapath rules are only
-	// programmed for backend pods hosted here. Empty disables the check and
-	// restores the previous cluster-wide behavior.
+	// NodeName is the node this instance runs on. It scopes the ingress
+	// half of the datapath — the destination rewrite and the port filter —
+	// to backend pods hosted here. Empty disables the check and programs
+	// everything everywhere.
 	NodeName string
 }
 
@@ -115,17 +116,20 @@ func endpointNode(ep *v1.Endpoints) (string, bool) {
 	return *node, true
 }
 
-// servesEndpoint reports whether this node must program datapath rules for ep.
+// servesEndpoint reports whether this node hosts ep's backend, and may
+// therefore program the ingress half of the datapath.
 //
-// The rules are node-local: only the node hosting the backend pod may rewrite
-// the service IP. Programming them cluster-wide makes a non-owning node
-// translate the destination before the packet even leaves it, so the owning
-// node records a conntrack tuple the SNATed reply can no longer match, and
-// port_filter drops that reply.
+// Only the hosting node may rewrite the destination. Doing it cluster-wide
+// makes a non-owning node translate the destination before the packet even
+// leaves it, so the owning node records a conntrack tuple the SNATed reply can
+// no longer match, and port_filter drops that reply.
+//
+// This says nothing about the egress half: the source rewrite is programmed on
+// every node regardless, see applyRules.
 //
 // When the node name is unknown (NODE_NAME not injected, or an endpoint
-// carrying no NodeName) the rules are programmed anyway, so an older chart
-// keeps the previous behavior instead of silently losing the datapath.
+// carrying no NodeName) the ingress rules are programmed anyway, so an older
+// chart keeps the previous behavior instead of silently losing the datapath.
 func (c *ServicesController) servesEndpoint(ep *v1.Endpoints) bool {
 	if c.NodeName == "" {
 		return true
@@ -137,27 +141,55 @@ func (c *ServicesController) servesEndpoint(ep *v1.Endpoints) bool {
 	return node == c.NodeName
 }
 
-// applyRules programs the datapath for a (service, endpoint) pair when this
-// node hosts the backend pod, and withdraws it otherwise. Both objects must
-// already have been checked with hasValidServiceIP/hasValidEndpointIP.
+// applyRules programs the datapath for a (service, endpoint) pair. The two
+// halves have different scopes. Both objects must already have been checked
+// with hasValidServiceIP/hasValidEndpointIP.
 func (c *ServicesController) applyRules(svc *v1.Service, ep *v1.Endpoints, ctx string) {
 	svcIP := svc.Status.LoadBalancer.Ingress[0].IP
 	podIP := ep.Subsets[0].Addresses[0].IP
 
+	// The source rewrite goes on every node, including the ones that do not
+	// host the backend. When the client is inside the cluster, kube-ovn SNATs
+	// it to its own node address, which OVN knows how to reach: the backend's
+	// reply is then handed straight to that node over the Geneve tunnel and
+	// never traverses the backend node's netfilter hooks. The client's node is
+	// the last place where the pod IP can still be turned back into the
+	// service IP the client's conntrack is waiting for. Without it the reply
+	// arrives with the wrong source and the client answers it with a RST.
+	if err := c.Proxy.EnsureEgressSNAT(svcIP, podIP); err != nil {
+		log.Error(err, "failed to ensure egress SNAT "+ctx, "svcIP", svcIP, "podIP", podIP)
+	}
+
+	// The destination rewrite and the port filter stay on the hosting node.
 	if !c.servesEndpoint(ep) {
-		c.withdrawRules(svcIP, podIP, ctx+" (backend not on this node)")
+		c.withdrawIngressRules(svcIP, podIP, ctx+" (backend not on this node)")
 		return
 	}
 
-	c.Proxy.EnsureRules(svcIP, podIP)
+	if err := c.Proxy.EnsureIngressDNAT(svcIP, podIP); err != nil {
+		log.Error(err, "failed to ensure ingress DNAT "+ctx, "svcIP", svcIP, "podIP", podIP)
+	}
 	c.reconcilePortFilter(svc, svcIP, podIP, ctx)
 }
 
-// withdrawRules removes every datapath entry for the pair. Absent entries are
-// not an error.
-func (c *ServicesController) withdrawRules(svcIP, podIP, ctx string) {
+// withdrawIngressRules removes the ingress half only — destination rewrite and
+// port filter — and leaves the source rewrite in place. This is what a node
+// that does not host the backend must end up with.
+func (c *ServicesController) withdrawIngressRules(svcIP, podIP, ctx string) {
 	c.clearPortFilter(svcIP, podIP, ctx)
-	c.Proxy.DeleteRules(svcIP, podIP)
+	if err := c.Proxy.DeleteIngressDNAT(svcIP, podIP); err != nil {
+		log.Error(err, "failed to delete ingress DNAT "+ctx, "svcIP", svcIP, "podIP", podIP)
+	}
+}
+
+// withdrawRules removes every datapath entry for the pair, both halves. Used
+// when the pair itself is going away: service deleted, endpoint gone, or a pod
+// IP that has been replaced. Absent entries are not an error.
+func (c *ServicesController) withdrawRules(svcIP, podIP, ctx string) {
+	c.withdrawIngressRules(svcIP, podIP, ctx)
+	if err := c.Proxy.DeleteEgressSNAT(svcIP, podIP); err != nil {
+		log.Error(err, "failed to delete egress SNAT "+ctx, "svcIP", svcIP, "podIP", podIP)
+	}
 }
 
 // withdrawStaleEndpoint drops the rules of a previous endpoint whose pod IP no
@@ -334,8 +366,7 @@ func (c *ServicesController) deleteServiceFunc(obj interface{}) {
 
 	svcIP := se.Service.Status.LoadBalancer.Ingress[0].IP
 	podIP := se.Endpoint.Subsets[0].Addresses[0].IP
-	c.clearPortFilter(svcIP, podIP, "on svc deletion")
-	c.Proxy.DeleteRules(svcIP, podIP)
+	c.withdrawRules(svcIP, podIP, "on svc deletion")
 	c.Services.Delete(svc.Namespace, svc.Name)
 }
 
@@ -354,8 +385,7 @@ func (c *ServicesController) updateServiceFunc(oldObj, newObj interface{}) {
 			if hasValidServiceIP(se.Service) && hasValidEndpointIP(se.Endpoint) {
 				svcIP := se.Service.Status.LoadBalancer.Ingress[0].IP
 				podIP := se.Endpoint.Subsets[0].Addresses[0].IP
-				c.clearPortFilter(svcIP, podIP, "on annotation removal")
-				c.Proxy.DeleteRules(svcIP, podIP)
+				c.withdrawRules(svcIP, podIP, "on annotation removal")
 			}
 			c.Services.Delete(svc.Namespace, svc.Name)
 		}
@@ -368,8 +398,7 @@ func (c *ServicesController) updateServiceFunc(oldObj, newObj interface{}) {
 			if hasValidServiceIP(se.Service) && hasValidEndpointIP(se.Endpoint) {
 				svcIP := se.Service.Status.LoadBalancer.Ingress[0].IP
 				podIP := se.Endpoint.Subsets[0].Addresses[0].IP
-				c.clearPortFilter(svcIP, podIP, "on svc IP loss")
-				c.Proxy.DeleteRules(svcIP, podIP)
+				c.withdrawRules(svcIP, podIP, "on svc IP loss")
 			}
 			c.Services.Delete(svc.Namespace, svc.Name)
 		}
@@ -395,9 +424,10 @@ func (c *ServicesController) updateServiceFunc(oldObj, newObj interface{}) {
 	if ep == nil || !hasValidEndpointIP(ep) {
 		if se, exists := c.Services.Get(svc.Namespace, svc.Name); exists &&
 			hasValidServiceIP(se.Service) && hasValidEndpointIP(se.Endpoint) {
-			c.Proxy.DeleteRules(
+			c.withdrawRules(
 				se.Service.Status.LoadBalancer.Ingress[0].IP,
 				se.Endpoint.Subsets[0].Addresses[0].IP,
+				"on endpoint loss",
 			)
 		}
 		c.Services.Set(svc.Namespace, svc.Name, &ServiceEndpoints{Service: svc, Endpoint: nil})
@@ -459,8 +489,7 @@ func (c *ServicesController) deleteEndpointFunc(obj interface{}) {
 	}
 	svcIP := se.Service.Status.LoadBalancer.Ingress[0].IP
 	podIP := se.Endpoint.Subsets[0].Addresses[0].IP
-	c.clearPortFilter(svcIP, podIP, "on endpoint delete")
-	c.Proxy.DeleteRules(svcIP, podIP)
+	c.withdrawRules(svcIP, podIP, "on endpoint delete")
 	// Set the endpoint to nil.
 	c.Services.SetEndpoint(ep.Namespace, ep.Name, nil)
 }
@@ -482,8 +511,7 @@ func (c *ServicesController) updateEndpointFunc(oldObj, newObj interface{}) {
 		if hasValidServiceIP(se.Service) && hasValidEndpointIP(se.Endpoint) {
 			svcIP := se.Service.Status.LoadBalancer.Ingress[0].IP
 			oldPodIP := se.Endpoint.Subsets[0].Addresses[0].IP
-			c.clearPortFilter(svcIP, oldPodIP, "on endpoint invalidation")
-			c.Proxy.DeleteRules(svcIP, oldPodIP)
+			c.withdrawRules(svcIP, oldPodIP, "on endpoint invalidation")
 		}
 		c.Services.SetEndpoint(ep.Namespace, ep.Name, ep)
 		return
@@ -620,34 +648,33 @@ func (c *ServicesController) clearPortFilter(svcIP, podIP, ctx string) {
 
 // cleanupRemovedServices performs an initial cleanup for removed services.
 func (c *ServicesController) cleanupRemovedServices() error {
-	keepMap := make(map[string]string)
+	// keepEgress holds every managed pair, because the source rewrite is
+	// programmed cluster-wide. keepIngress holds only the pairs whose backend
+	// runs here, because the destination rewrite is node-local. The difference
+	// between the two is what purges entries inherited from a build that
+	// scoped both maps alike.
+	keepEgress := make(map[string]string)
+	keepIngress := make(map[string]string)
 	// Get a snapshot of all managed services.
 	allServices := c.Services.GetAll()
 	for _, serviceEndpoints := range allServices {
-		if serviceEndpoints.Service != nil && serviceEndpoints.Endpoint != nil {
-			var serviceIP, endpointIP string
+		if serviceEndpoints.Service == nil || serviceEndpoints.Endpoint == nil {
+			continue
+		}
+		if !hasValidServiceIP(serviceEndpoints.Service) || !hasValidEndpointIP(serviceEndpoints.Endpoint) {
+			continue
+		}
 
-			// Backends hosted elsewhere are not ours to program, so they must
-			// not be kept: this is what purges entries inherited from a build
-			// that programmed every service on every node.
-			if !c.servesEndpoint(serviceEndpoints.Endpoint) {
-				continue
-			}
+		serviceIP := serviceEndpoints.Service.Status.LoadBalancer.Ingress[0].IP
+		endpointIP := serviceEndpoints.Endpoint.Subsets[0].Addresses[0].IP
 
-			if len(serviceEndpoints.Service.Status.LoadBalancer.Ingress) > 0 {
-				serviceIP = serviceEndpoints.Service.Status.LoadBalancer.Ingress[0].IP
-			}
-			if len(serviceEndpoints.Endpoint.Subsets) > 0 && len(serviceEndpoints.Endpoint.Subsets[0].Addresses) > 0 {
-				endpointIP = serviceEndpoints.Endpoint.Subsets[0].Addresses[0].IP
-			}
-
-			if serviceIP != "" && endpointIP != "" {
-				keepMap[serviceIP] = endpointIP
-			}
+		keepEgress[serviceIP] = endpointIP
+		if c.servesEndpoint(serviceEndpoints.Endpoint) {
+			keepIngress[serviceIP] = endpointIP
 		}
 	}
 	// Call InitialCleanup with the snapshot.
-	if err := c.Proxy.CleanupRules(keepMap); err != nil {
+	if err := c.Proxy.CleanupRules(keepEgress, keepIngress); err != nil {
 		return fmt.Errorf("failed to perform initial cleanup: %w", err)
 	}
 	// Build per-svc port filter snapshot for services in non-passthrough mode.

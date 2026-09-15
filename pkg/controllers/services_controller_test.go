@@ -37,16 +37,35 @@ func lbService(svcIP string, annot map[string]string) *v1.Service {
 // recordingProxy captures which datapath calls a controller makes.
 type recordingProxy struct {
 	nat.DummyProxyProcessor
-	calls []string
+	calls       []string
+	keepEgress  map[string]string
+	keepIngress map[string]string
 }
 
-func (r *recordingProxy) EnsureRules(svcIP, podIP string) error {
-	r.calls = append(r.calls, "EnsureRules")
+func (r *recordingProxy) EnsureEgressSNAT(svcIP, podIP string) error {
+	r.calls = append(r.calls, "EnsureEgressSNAT")
 	return nil
 }
 
-func (r *recordingProxy) DeleteRules(svcIP, podIP string) error {
-	r.calls = append(r.calls, "DeleteRules")
+func (r *recordingProxy) DeleteEgressSNAT(svcIP, podIP string) error {
+	r.calls = append(r.calls, "DeleteEgressSNAT")
+	return nil
+}
+
+func (r *recordingProxy) EnsureIngressDNAT(svcIP, podIP string) error {
+	r.calls = append(r.calls, "EnsureIngressDNAT")
+	return nil
+}
+
+func (r *recordingProxy) DeleteIngressDNAT(svcIP, podIP string) error {
+	r.calls = append(r.calls, "DeleteIngressDNAT")
+	return nil
+}
+
+func (r *recordingProxy) CleanupRules(keepEgress, keepIngress map[string]string) error {
+	r.calls = append(r.calls, "CleanupRules")
+	r.keepEgress = keepEgress
+	r.keepIngress = keepIngress
 	return nil
 }
 
@@ -92,26 +111,46 @@ func TestServesEndpoint(t *testing.T) {
 	}
 }
 
-// A non-owning node must not translate the service IP: doing so desynchronises
-// conntrack on the owning node and gets the reply dropped by port_filter.
-func TestApplyRulesSkipsRemoteBackend(t *testing.T) {
+// The owning node programs both halves of the datapath.
+func TestApplyRulesProgramsBothHalvesOnOwningNode(t *testing.T) {
 	svc := lbService("192.0.2.10", map[string]string{"networking.cozystack.io/wholeIP": "false"})
 
 	local := &recordingProxy{}
 	localCtrl := &ServicesController{Proxy: local, NodeName: "node-a"}
 	localCtrl.applyRules(svc, epOnNode("10.0.0.1", "node-a"), "test")
-	if !local.has("EnsureRules") || !local.has("EnsurePortFilter") {
-		t.Errorf("owning node must program the datapath, got %v", local.calls)
+
+	for _, want := range []string{"EnsureEgressSNAT", "EnsureIngressDNAT", "EnsurePortFilter"} {
+		if !local.has(want) {
+			t.Errorf("owning node must call %s, got %v", want, local.calls)
+		}
 	}
+}
+
+// A non-owning node must not translate the destination — doing so
+// desynchronises conntrack on the owning node and gets the reply dropped by
+// port_filter — but it must still program the source rewrite.
+//
+// That rewrite is the only thing that repairs a reply reaching this node
+// straight over the overlay, which is what happens whenever the client is
+// inside the cluster and kube-ovn SNATs it to this node's own address.
+func TestApplyRulesKeepsEgressSNATOnRemoteBackend(t *testing.T) {
+	svc := lbService("192.0.2.10", map[string]string{"networking.cozystack.io/wholeIP": "false"})
 
 	remote := &recordingProxy{}
 	remoteCtrl := &ServicesController{Proxy: remote, NodeName: "node-a"}
 	remoteCtrl.applyRules(svc, epOnNode("10.0.0.1", "node-b"), "test")
-	if remote.has("EnsureRules") || remote.has("EnsurePortFilter") {
-		t.Errorf("non-owning node must not program the datapath, got %v", remote.calls)
+
+	if !remote.has("EnsureEgressSNAT") {
+		t.Errorf("non-owning node must still program the source rewrite, got %v", remote.calls)
 	}
-	if !remote.has("DeleteRules") {
-		t.Errorf("non-owning node must withdraw any inherited rules, got %v", remote.calls)
+	if remote.has("DeleteEgressSNAT") {
+		t.Errorf("non-owning node must not withdraw the source rewrite, got %v", remote.calls)
+	}
+	if remote.has("EnsureIngressDNAT") || remote.has("EnsurePortFilter") {
+		t.Errorf("non-owning node must not program the ingress half, got %v", remote.calls)
+	}
+	if !remote.has("DeleteIngressDNAT") {
+		t.Errorf("non-owning node must withdraw an inherited destination rewrite, got %v", remote.calls)
 	}
 }
 
@@ -122,8 +161,12 @@ func TestWithdrawStaleEndpoint(t *testing.T) {
 	moved := &recordingProxy{}
 	movedCtrl := &ServicesController{Proxy: moved, NodeName: "node-a"}
 	movedCtrl.withdrawStaleEndpoint(svc, epOnNode("10.0.0.1", "node-a"), "10.0.0.2", "test")
-	if !moved.has("DeleteRules") {
-		t.Errorf("changed pod IP must withdraw the previous mapping, got %v", moved.calls)
+	// A pod IP that is gone must leave nothing behind, in either half: every
+	// node carries its source rewrite, so every node has to drop it.
+	for _, want := range []string{"DeleteIngressDNAT", "DeleteEgressSNAT"} {
+		if !moved.has(want) {
+			t.Errorf("changed pod IP must call %s, got %v", want, moved.calls)
+		}
 	}
 
 	same := &recordingProxy{}
@@ -203,5 +246,51 @@ func TestAllowICMP(t *testing.T) {
 				t.Errorf("allowICMP = %v, want %v", got, c.expect)
 			}
 		})
+	}
+}
+
+// The startup snapshot must keep every managed pair in the egress map and only
+// the locally hosted ones in the ingress map. Handing the same set to both is
+// exactly what leaves an intra-cluster client without a usable reply.
+func TestCleanupRemovedServicesScopesKeepMaps(t *testing.T) {
+	annot := map[string]string{"networking.cozystack.io/wholeIP": "false"}
+
+	ctrl := &ServicesController{Proxy: &recordingProxy{}, NodeName: "node-a"}
+	ctrl.Services = NewServiceMap()
+	ctrl.Services.Set("ns", "local", &ServiceEndpoints{
+		Service:  lbService("192.0.2.10", annot),
+		Endpoint: epOnNode("10.0.0.1", "node-a"),
+	})
+	ctrl.Services.Set("ns", "remote", &ServiceEndpoints{
+		Service:  lbService("192.0.2.11", annot),
+		Endpoint: epOnNode("10.0.0.2", "node-b"),
+	})
+	// A service still waiting for its endpoint contributes to neither map.
+	ctrl.Services.Set("ns", "pending", &ServiceEndpoints{
+		Service:  lbService("192.0.2.12", annot),
+		Endpoint: nil,
+	})
+
+	if err := ctrl.cleanupRemovedServices(); err != nil {
+		t.Fatalf("cleanupRemovedServices: %v", err)
+	}
+	rec := ctrl.Proxy.(*recordingProxy)
+
+	wantEgress := map[string]string{"192.0.2.10": "10.0.0.1", "192.0.2.11": "10.0.0.2"}
+	if len(rec.keepEgress) != len(wantEgress) {
+		t.Fatalf("keepEgress = %v, want %v", rec.keepEgress, wantEgress)
+	}
+	for svc, pod := range wantEgress {
+		if rec.keepEgress[svc] != pod {
+			t.Errorf("keepEgress[%s] = %q, want %q", svc, rec.keepEgress[svc], pod)
+		}
+	}
+
+	wantIngress := map[string]string{"192.0.2.10": "10.0.0.1"}
+	if len(rec.keepIngress) != len(wantIngress) {
+		t.Fatalf("keepIngress = %v, want %v", rec.keepIngress, wantIngress)
+	}
+	if rec.keepIngress["192.0.2.10"] != "10.0.0.1" {
+		t.Errorf("keepIngress = %v, want %v", rec.keepIngress, wantIngress)
 	}
 }
