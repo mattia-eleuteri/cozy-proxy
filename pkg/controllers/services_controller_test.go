@@ -2,7 +2,10 @@ package controllers
 
 import (
 	"errors"
+	"fmt"
+	"sync"
 	"testing"
+	"time"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -38,6 +41,7 @@ func lbService(svcIP string, annot map[string]string) *v1.Service {
 // recordingProxy captures which datapath calls a controller makes.
 type recordingProxy struct {
 	nat.DummyProxyProcessor
+	mu          sync.Mutex
 	calls       []string
 	keepEgress  map[string]string
 	keepIngress map[string]string
@@ -52,7 +56,7 @@ type recordingProxy struct {
 }
 
 func (r *recordingProxy) EnsureEgressSNAT(svcIP, podIP string) error {
-	r.calls = append(r.calls, "EnsureEgressSNAT")
+	r.record("EnsureEgressSNAT")
 	if r.failEgress {
 		return errors.New("commit refused")
 	}
@@ -60,22 +64,22 @@ func (r *recordingProxy) EnsureEgressSNAT(svcIP, podIP string) error {
 }
 
 func (r *recordingProxy) DeleteEgressSNAT(svcIP, podIP string) error {
-	r.calls = append(r.calls, "DeleteEgressSNAT")
+	r.record("DeleteEgressSNAT")
 	return nil
 }
 
 func (r *recordingProxy) EnsureIngressDNAT(svcIP, podIP string) error {
-	r.calls = append(r.calls, "EnsureIngressDNAT")
+	r.record("EnsureIngressDNAT")
 	return nil
 }
 
 func (r *recordingProxy) DeleteIngressDNAT(svcIP, podIP string) error {
-	r.calls = append(r.calls, "DeleteIngressDNAT")
+	r.record("DeleteIngressDNAT")
 	return nil
 }
 
 func (r *recordingProxy) CleanupRules(keepEgress, keepIngress map[string]string) error {
-	r.calls = append(r.calls, "CleanupRules")
+	r.record("CleanupRules")
 	r.keepEgress = keepEgress
 	r.keepIngress = keepIngress
 	if r.failCleanup {
@@ -85,7 +89,7 @@ func (r *recordingProxy) CleanupRules(keepEgress, keepIngress map[string]string)
 }
 
 func (r *recordingProxy) EnsurePortFilter(svcIP, podIP string, ports []v1.ServicePort) error {
-	r.calls = append(r.calls, "EnsurePortFilter")
+	r.record("EnsurePortFilter")
 	if r.failPortFilter {
 		return errors.New("commit refused")
 	}
@@ -93,11 +97,21 @@ func (r *recordingProxy) EnsurePortFilter(svcIP, podIP string, ports []v1.Servic
 }
 
 func (r *recordingProxy) DeletePortFilter(svcIP, podIP string) error {
-	r.calls = append(r.calls, "DeletePortFilter")
+	r.record("DeletePortFilter")
 	return nil
 }
 
+// record appends under the lock: the retry loop and the informer callbacks
+// both drive the proxy in the concurrency test.
+func (r *recordingProxy) record(call string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls = append(r.calls, call)
+}
+
 func (r *recordingProxy) has(call string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	for _, c := range r.calls {
 		if c == call {
 			return true
@@ -435,4 +449,59 @@ func TestSplitKey(t *testing.T) {
 			t.Errorf("splitKey(%q) = (%q,%q,%v), want (%q,%q,%v)", c.key, ns, name, ok, c.ns, c.name, c.ok)
 		}
 	}
+}
+
+// The retry goroutine and the informer callbacks reconcile the same stored
+// pair. The retry must read it under the map lock and hold the reconciliation
+// lock while it programs, or it applies an endpoint the update has already
+// withdrawn — pointing the service IP at a pod that is gone.
+//
+// Run with -race: an unsynchronized read of the shared Endpoint field shows up
+// here, which is what reading it through ServiceMap.Get used to do.
+func TestRetryIsSerializedAgainstEndpointUpdates(t *testing.T) {
+	svc := lbService("192.0.2.10", map[string]string{"networking.cozystack.io/wholeIP": "false"})
+	svc.Namespace, svc.Name = "ns", "svc"
+
+	ctrl := &ServicesController{Proxy: &recordingProxy{}, NodeName: "node-a"}
+	ctrl.Services = NewServiceMap()
+	ctrl.Services.Set("ns", "svc", &ServiceEndpoints{
+		Service:  svc,
+		Endpoint: epOnNode("10.0.0.1", "node-a"),
+	})
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+
+	// Informer side: keep replacing the endpoint, as a migrating VM does.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			ctrl.Services.SetEndpoint("ns", "svc", epOnNode(fmt.Sprintf("10.0.0.%d", i%250+1), "node-a"))
+		}
+	}()
+
+	// Retry side.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			ctrl.markPending("ns", "svc")
+			ctrl.retryPending()
+		}
+	}()
+
+	time.Sleep(150 * time.Millisecond)
+	close(stop)
+	wg.Wait()
 }

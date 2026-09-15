@@ -56,6 +56,22 @@ func (sm *ServiceMap) Get(namespace, name string) (*ServiceEndpoints, bool) {
 	return se, ok
 }
 
+// Snapshot returns the stored Service and Endpoints under the lock.
+//
+// Get hands back the pointer to the shared ServiceEndpoints, whose Endpoint
+// field SetEndpoint rewrites under the lock. Reading that field after Get has
+// returned is an unsynchronized read, so any caller outside the informer
+// callbacks has to come through here.
+func (sm *ServiceMap) Snapshot(namespace, name string) (*v1.Service, *v1.Endpoints, bool) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	se, ok := sm.serviceMapping[makeKey(namespace, name)]
+	if !ok || se == nil {
+		return nil, nil, false
+	}
+	return se.Service, se.Endpoint, true
+}
+
 // Set stores the ServiceEndpoints under the given namespace and name.
 func (sm *ServiceMap) Set(namespace, name string, se *ServiceEndpoints) {
 	sm.mu.Lock()
@@ -107,6 +123,16 @@ type ServicesController struct {
 	// RetryInterval is how often failed datapath writes are re-attempted.
 	// Zero selects defaultRetryInterval.
 	RetryInterval time.Duration
+
+	// reconcileMu serializes whole reconciliations, not just the individual
+	// datapath calls the proxy already serializes.
+	//
+	// An informer callback withdraws the rules of a replaced endpoint and then
+	// applies the new one. Without this lock the retry goroutine can slip
+	// between the two with the endpoint it snapshotted a moment earlier, and
+	// its writes land after the update — restoring the mapping of a pod that
+	// is gone, which points the service IP at a dead backend.
+	reconcileMu sync.Mutex
 
 	// retryMu guards pendingServices and pendingCleanup.
 	retryMu sync.Mutex
@@ -177,14 +203,7 @@ func (c *ServicesController) retryPending() {
 		if !ok {
 			continue
 		}
-		se, exists := c.Services.Get(ns, name)
-		if !exists || !hasValidServiceIP(se.Service) || !hasValidEndpointIP(se.Endpoint) {
-			// The service went away or lost its endpoint; the delete paths
-			// have already withdrawn its rules.
-			continue
-		}
-		log.Info("retrying datapath programming", "service", key)
-		c.applyRules(se.Service, se.Endpoint, "on retry")
+		c.retryOne(ns, name, key)
 	}
 
 	if cleanup {
@@ -193,6 +212,24 @@ func (c *ServicesController) retryPending() {
 			log.Error(err, "cleanup retry failed, will try again")
 		}
 	}
+}
+
+// retryOne re-applies a single service, reading its state and programming the
+// datapath under the reconciliation lock so an informer callback cannot
+// interleave and have this attempt restore what it just withdrew.
+func (c *ServicesController) retryOne(namespace, name, key string) {
+	c.reconcileMu.Lock()
+	defer c.reconcileMu.Unlock()
+
+	svc, ep, exists := c.Services.Snapshot(namespace, name)
+	if !exists || !hasValidServiceIP(svc) || !hasValidEndpointIP(ep) {
+		// The service went away or lost its endpoint; the delete paths have
+		// already withdrawn its rules. Drop it from the queue.
+		c.clearPending(namespace, name)
+		return
+	}
+	log.Info("retrying datapath programming", "service", key)
+	c.applyRules(svc, ep, "on retry")
 }
 
 // runRetryLoop re-attempts failed datapath writes until the context ends.
@@ -458,6 +495,10 @@ func (c *ServicesController) Start(ctx context.Context) error {
 
 // addServiceFunc handles the addition of a service.
 func (c *ServicesController) addServiceFunc(obj interface{}) {
+	// Reconciliations are serialized end to end, see reconcileMu.
+	c.reconcileMu.Lock()
+	defer c.reconcileMu.Unlock()
+
 	svc, ok := obj.(*v1.Service)
 	if !ok {
 		// Object is not a Service.
@@ -490,6 +531,10 @@ func (c *ServicesController) addServiceFunc(obj interface{}) {
 
 // deleteServiceFunc handles the deletion of a service.
 func (c *ServicesController) deleteServiceFunc(obj interface{}) {
+	// Reconciliations are serialized end to end, see reconcileMu.
+	c.reconcileMu.Lock()
+	defer c.reconcileMu.Unlock()
+
 	svc, ok := obj.(*v1.Service)
 	if !ok {
 		// object is not Service
@@ -513,6 +558,10 @@ func (c *ServicesController) deleteServiceFunc(obj interface{}) {
 
 // updateServiceFunc handles service updates.
 func (c *ServicesController) updateServiceFunc(oldObj, newObj interface{}) {
+	// Reconciliations are serialized end to end, see reconcileMu.
+	c.reconcileMu.Lock()
+	defer c.reconcileMu.Unlock()
+
 	// Cast the object to a Service type.
 	svc, ok := newObj.(*v1.Service)
 	if !ok {
@@ -588,6 +637,10 @@ func (c *ServicesController) updateServiceFunc(oldObj, newObj interface{}) {
 
 // addEndpointFunc handles the addition of endpoints.
 func (c *ServicesController) addEndpointFunc(obj interface{}) {
+	// Reconciliations are serialized end to end, see reconcileMu.
+	c.reconcileMu.Lock()
+	defer c.reconcileMu.Unlock()
+
 	// Cast the object to an Endpoints type.
 	ep, ok := obj.(*v1.Endpoints)
 	if !ok {
@@ -614,6 +667,10 @@ func (c *ServicesController) addEndpointFunc(obj interface{}) {
 
 // deleteEndpointFunc handles endpoint deletions.
 func (c *ServicesController) deleteEndpointFunc(obj interface{}) {
+	// Reconciliations are serialized end to end, see reconcileMu.
+	c.reconcileMu.Lock()
+	defer c.reconcileMu.Unlock()
+
 	ep, ok := obj.(*v1.Endpoints)
 	if !ok {
 		// object is not Endpoints
@@ -637,6 +694,10 @@ func (c *ServicesController) deleteEndpointFunc(obj interface{}) {
 
 // updateEndpointFunc handles updates to endpoints.
 func (c *ServicesController) updateEndpointFunc(oldObj, newObj interface{}) {
+	// Reconciliations are serialized end to end, see reconcileMu.
+	c.reconcileMu.Lock()
+	defer c.reconcileMu.Unlock()
+
 	ep, ok := newObj.(*v1.Endpoints)
 	if !ok {
 		// object is not Endpoints
@@ -800,6 +861,10 @@ func (c *ServicesController) clearPortFilter(svcIP, podIP, ctx string) {
 
 // cleanupRemovedServices performs an initial cleanup for removed services.
 func (c *ServicesController) cleanupRemovedServices() error {
+	// Reconciliations are serialized end to end, see reconcileMu.
+	c.reconcileMu.Lock()
+	defer c.reconcileMu.Unlock()
+
 	// keepEgress holds every managed pair, because the source rewrite is
 	// programmed cluster-wide. keepIngress holds only the pairs whose backend
 	// runs here, because the destination rewrite is node-local. The difference
