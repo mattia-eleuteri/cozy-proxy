@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sync"
 
 	"github.com/google/nftables"
 	"github.com/google/nftables/binaryutil"
@@ -18,6 +19,18 @@ var log = ctrl.Log.WithName("nft-proxy-processor")
 
 // NFTProxyProcessor implements a NATProcessor using nftables.
 type NFTProxyProcessor struct {
+	// mu serializes every queue-then-flush sequence below.
+	//
+	// nftables.Conn guards its own message list, but not the interval between
+	// queueing messages and committing them. Two informer goroutines — plus
+	// the startup reconciliation — share this connection, so without this
+	// lock one flush carries the other caller's half-queued messages. A batch
+	// is a single transaction: one stale deletion in it aborts the other
+	// caller's addition, which is then never retried because the controller
+	// only reacts to events. The service stays unprogrammed until the next
+	// one, which is how a public IP can go dark for minutes after a restart.
+	mu sync.Mutex
+
 	conn *nftables.Conn
 
 	// Table "cozy_proxy" will contain all objects.
@@ -37,6 +50,9 @@ type NFTProxyProcessor struct {
 // InitRules initializes the nftables configuration in a single table "cozy_proxy".
 // It flushes the entire ruleset, then re-creates the table with the desired sets, maps, and chains.
 func (p *NFTProxyProcessor) InitRules() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	log.Info("Initializing nftables NAT configuration")
 
 	// Create a new connection if needed.
@@ -393,6 +409,9 @@ func (p *NFTProxyProcessor) InitRules() error {
 //
 // Programmed on every node, see ProxyProcessor.EnsureEgressSNAT.
 func (p *NFTProxyProcessor) EnsureEgressSNAT(svcIP, podIP string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	log.Info("Ensuring egress SNAT", "svcIP", svcIP, "podIP", podIP)
 
 	parsedSvcIP, parsedPodIP, err := parsePair(svcIP, podIP)
@@ -416,6 +435,13 @@ func (p *NFTProxyProcessor) EnsureEgressSNAT(svcIP, podIP string) error {
 				log.Error(err, "Failed to delete stale pod_svc mapping", "podIP", podIP)
 				return fmt.Errorf("failed to delete stale pod_svc mapping: %v", err)
 			}
+			// Commit the removal on its own. Sharing the batch with the
+			// addition below would let an element that is already gone abort
+			// the addition too, and nothing retries it.
+			if err := p.flushTolerateENOENT("EnsureEgressSNAT conflict removal"); err != nil {
+				log.Error(err, "Failed to commit stale pod_svc removal", "podIP", podIP)
+				return fmt.Errorf("failed to commit stale pod_svc removal: %v", err)
+			}
 		}
 		break
 	}
@@ -435,6 +461,9 @@ func (p *NFTProxyProcessor) EnsureEgressSNAT(svcIP, podIP string) error {
 // DeleteEgressSNAT removes the pod_svc entry for the pair. An entry that is
 // already gone is not an error.
 func (p *NFTProxyProcessor) DeleteEgressSNAT(svcIP, podIP string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	log.Info("Deleting egress SNAT", "svcIP", svcIP, "podIP", podIP)
 
 	parsedSvcIP, parsedPodIP, err := parsePair(svcIP, podIP)
@@ -463,6 +492,9 @@ func (p *NFTProxyProcessor) DeleteEgressSNAT(svcIP, podIP string) error {
 // Programmed only by the node hosting the backend, see
 // ProxyProcessor.EnsureIngressDNAT.
 func (p *NFTProxyProcessor) EnsureIngressDNAT(svcIP, podIP string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	log.Info("Ensuring ingress DNAT", "svcIP", svcIP, "podIP", podIP)
 
 	parsedSvcIP, parsedPodIP, err := parsePair(svcIP, podIP)
@@ -486,6 +518,11 @@ func (p *NFTProxyProcessor) EnsureIngressDNAT(svcIP, podIP string) error {
 				log.Error(err, "Failed to delete stale svc_pod mapping", "svcIP", svcIP)
 				return fmt.Errorf("failed to delete stale svc_pod mapping: %v", err)
 			}
+			// Commit the removal on its own, see EnsureEgressSNAT.
+			if err := p.flushTolerateENOENT("EnsureIngressDNAT conflict removal"); err != nil {
+				log.Error(err, "Failed to commit stale svc_pod removal", "svcIP", svcIP)
+				return fmt.Errorf("failed to commit stale svc_pod removal: %v", err)
+			}
 		}
 		break
 	}
@@ -505,6 +542,9 @@ func (p *NFTProxyProcessor) EnsureIngressDNAT(svcIP, podIP string) error {
 // DeleteIngressDNAT removes the svc_pod entry for the pair. An entry that is
 // already gone is not an error.
 func (p *NFTProxyProcessor) DeleteIngressDNAT(svcIP, podIP string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	log.Info("Deleting ingress DNAT", "svcIP", svcIP, "podIP", podIP)
 
 	parsedSvcIP, parsedPodIP, err := parsePair(svcIP, podIP)
@@ -613,6 +653,9 @@ func (p *NFTProxyProcessor) deleteElementsTolerant(m *nftables.Set, elems []nfta
 // Anything present in a map but absent from its keep set is removed, which is
 // what purges state inherited from a build that scoped the two maps alike.
 func (p *NFTProxyProcessor) CleanupRules(keepEgress, keepIngress map[string]string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	log.Info("Starting CleanupRules", "keepEgress", keepEgress, "keepIngress", keepIngress)
 
 	// --- Step 1: collect what has to change in both maps ---
@@ -721,13 +764,16 @@ func (p *NFTProxyProcessor) diffMap(m *nftables.Set, desired map[string]string) 
 // permitted on the post-DNAT pod IP; all other traffic destined to that
 // pod IP is dropped. Idempotent.
 func (p *NFTProxyProcessor) EnsurePortFilter(svcIP, podIP string, ports []corev1.ServicePort) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	// Empty ports list is documented as equivalent to DeletePortFilter:
 	// the caller wants to disable filtering for this pod entirely. Without
 	// this short-circuit we would add the pod to filtered_pods with no
 	// matching allowed_ports entries, which would drop every ingress packet
 	// to the pod IP — the opposite of "no filter".
 	if len(ports) == 0 {
-		return p.DeletePortFilter(svcIP, podIP)
+		return p.deletePortFilterLocked(svcIP, podIP)
 	}
 	log.Info("Ensuring port filter", "svcIP", svcIP, "podIP", podIP, "portCount", len(ports))
 
@@ -737,9 +783,15 @@ func (p *NFTProxyProcessor) EnsurePortFilter(svcIP, podIP string, ports []corev1
 	}
 
 	// 1. Remove any pre-existing entries in allowed_ports for podIP so we can
-	// rebuild the tuple set cleanly (idempotent).
+	// rebuild the tuple set cleanly (idempotent). Committed on its own: an
+	// element that is already gone would otherwise abort the additions below
+	// in the same transaction, leaving the pod in filtered_pods with no
+	// allowed port — every packet to it dropped.
 	if err := p.removeAllowedPortsForPod(parsedPodIP); err != nil {
 		return err
+	}
+	if err := p.flushTolerateENOENT("EnsurePortFilter port rebuild"); err != nil {
+		return fmt.Errorf("failed to commit allowed_ports rebuild for pod %s: %v", podIP, err)
 	}
 
 	// 2. Add podIP to filtered_pods (idempotent — Add ignores duplicates).
@@ -780,6 +832,16 @@ func (p *NFTProxyProcessor) EnsurePortFilter(svcIP, podIP string, ports []corev1
 // port entries for it. svcIP is used only for logging context. Tolerates
 // ENOENT for clean idempotency.
 func (p *NFTProxyProcessor) DeletePortFilter(svcIP, podIP string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return p.deletePortFilterLocked(svcIP, podIP)
+}
+
+// deletePortFilterLocked is DeletePortFilter without the lock, for callers
+// that already hold it. sync.Mutex is not reentrant, so EnsurePortFilter must
+// come through here rather than calling the exported method.
+func (p *NFTProxyProcessor) deletePortFilterLocked(svcIP, podIP string) error {
 	log.Info("Deleting port filter", "svcIP", svcIP, "podIP", podIP)
 	parsedPodIP := net.ParseIP(podIP).To4()
 	if parsedPodIP == nil {
@@ -811,6 +873,9 @@ func (p *NFTProxyProcessor) DeletePortFilter(svcIP, podIP string) error {
 // batches SetAddElements / SetDeleteElements per set, and Flushes exactly
 // once.
 func (p *NFTProxyProcessor) CleanupPortFilters(keep map[string]PortFilterEntry) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	log.Info("Starting CleanupPortFilters", "keepCount", len(keep))
 
 	// 1. Build desired state in memory.
@@ -952,6 +1017,9 @@ func (p *NFTProxyProcessor) removeAllowedPortsForPod(parsedPodIP net.IP) error {
 // traffic to that pod IP bypasses the port_filter drop rule. svcIP is used
 // only for logging context. Idempotent.
 func (p *NFTProxyProcessor) EnsureICMPAllow(svcIP, podIP string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	log.Info("Ensuring ICMP allow", "svcIP", svcIP, "podIP", podIP)
 	parsedPodIP := net.ParseIP(podIP).To4()
 	if parsedPodIP == nil {
@@ -970,6 +1038,9 @@ func (p *NFTProxyProcessor) EnsureICMPAllow(svcIP, podIP string) error {
 // DeleteICMPAllow removes podIP from icmp_allowed_pods. Tolerates ENOENT for
 // clean idempotency. svcIP is used only for logging context.
 func (p *NFTProxyProcessor) DeleteICMPAllow(svcIP, podIP string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	log.Info("Deleting ICMP allow", "svcIP", svcIP, "podIP", podIP)
 	parsedPodIP := net.ParseIP(podIP).To4()
 	if parsedPodIP == nil {
@@ -996,6 +1067,9 @@ func (p *NFTProxyProcessor) DeleteICMPAllow(svcIP, podIP string) error {
 // must remain in the set. Single-pass diff with one Flush, mirroring
 // CleanupPortFilters.
 func (p *NFTProxyProcessor) CleanupICMPAllow(keep map[string]string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	log.Info("Starting CleanupICMPAllow", "keepCount", len(keep))
 
 	desired := make(map[string]bool, len(keep))
