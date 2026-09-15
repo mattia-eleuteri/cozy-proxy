@@ -143,10 +143,58 @@ type ServicesController struct {
 	// next event — long enough for a public IP to stay dark for minutes.
 	pendingServices map[string]struct{}
 
+	// pendingWithdrawals holds datapath state that could not be removed.
+	//
+	// A failed withdrawal cannot go through pendingServices: by then the
+	// service is usually gone from Services, so there is nothing to re-derive
+	// the pair from. It is carried explicitly instead. Leaving it behind is
+	// not merely untidy — a stale pod_svc entry rewrites the source of
+	// whatever pod next receives that IP, which on a shared /16 means one
+	// tenant's egress leaving under another tenant's service IP.
+	pendingWithdrawals map[string]withdrawal
+
 	// pendingCleanup records that the startup reconciliation failed and has
 	// to run again. It stays non-fatal, but it no longer waits for the next
 	// event or the 12-hour informer resync.
 	pendingCleanup bool
+}
+
+// withdrawal is datapath state waiting to be removed.
+type withdrawal struct {
+	svcIP, podIP string
+	// egress also withdraws the source rewrite. False when only the ingress
+	// half has to go, which is the case on a node that stopped hosting the
+	// backend but still carries the cluster-wide source rewrite.
+	egress bool
+}
+
+// withdrawalKey identifies a pair independently of which half is pending.
+func withdrawalKey(svcIP, podIP string) string { return svcIP + "/" + podIP }
+
+// markWithdrawal queues datapath state for another removal attempt.
+func (c *ServicesController) markWithdrawal(svcIP, podIP string, egress bool) {
+	c.retryMu.Lock()
+	defer c.retryMu.Unlock()
+	if c.pendingWithdrawals == nil {
+		c.pendingWithdrawals = make(map[string]withdrawal)
+	}
+	k := withdrawalKey(svcIP, podIP)
+	// A full withdrawal supersedes an ingress-only one for the same pair.
+	if prev, ok := c.pendingWithdrawals[k]; ok && prev.egress {
+		egress = true
+	}
+	c.pendingWithdrawals[k] = withdrawal{svcIP: svcIP, podIP: podIP, egress: egress}
+}
+
+// clearWithdrawal drops a queued removal.
+//
+// Called when the same pair is programmed again — an endpoint that flapped back
+// to the pod IP whose withdrawal failed. Without this the retry would delete
+// the rules that were just reinstalled.
+func (c *ServicesController) clearWithdrawal(svcIP, podIP string) {
+	c.retryMu.Lock()
+	defer c.retryMu.Unlock()
+	delete(c.pendingWithdrawals, withdrawalKey(svcIP, podIP))
 }
 
 // defaultRetryInterval is short enough that a failed write is repaired well
@@ -180,23 +228,33 @@ func (c *ServicesController) markCleanupPending() {
 
 // takePending returns the queued work and clears it. Anything that fails again
 // is re-queued by the attempt itself.
-func (c *ServicesController) takePending() (services []string, cleanup bool) {
+func (c *ServicesController) takePending() (services []string, withdrawals []withdrawal, cleanup bool) {
 	c.retryMu.Lock()
 	defer c.retryMu.Unlock()
 	for k := range c.pendingServices {
 		services = append(services, k)
 	}
 	c.pendingServices = nil
+	for _, w := range c.pendingWithdrawals {
+		withdrawals = append(withdrawals, w)
+	}
+	c.pendingWithdrawals = nil
 	cleanup = c.pendingCleanup
 	c.pendingCleanup = false
-	return services, cleanup
+	return services, withdrawals, cleanup
 }
 
 // retryPending re-attempts everything that failed since the last pass. Every
 // datapath call is idempotent, so a re-attempt on something already correct is
 // a no-op.
 func (c *ServicesController) retryPending() {
-	services, cleanup := c.takePending()
+	services, withdrawals, cleanup := c.takePending()
+
+	// Withdrawals first: an apply for the same pair clears its queued removal
+	// at the moment it succeeds, so it wins either way.
+	for _, w := range withdrawals {
+		c.retryWithdrawal(w)
+	}
 
 	for _, key := range services {
 		ns, name, ok := splitKey(key)
@@ -212,6 +270,21 @@ func (c *ServicesController) retryPending() {
 			log.Error(err, "cleanup retry failed, will try again")
 		}
 	}
+}
+
+// retryWithdrawal re-attempts a removal that failed. The pair is carried
+// explicitly because the service it belonged to is usually gone by now.
+func (c *ServicesController) retryWithdrawal(w withdrawal) {
+	c.reconcileMu.Lock()
+	defer c.reconcileMu.Unlock()
+
+	log.Info("retrying datapath withdrawal", "svcIP", w.svcIP, "podIP", w.podIP, "egress", w.egress)
+	if w.egress {
+		// Re-queues itself on failure.
+		_ = c.withdrawRules(w.svcIP, w.podIP, "on retry")
+		return
+	}
+	_ = c.withdrawIngressRules(w.svcIP, w.podIP, "on retry")
 }
 
 // retryOne re-applies a single service, reading its state and programming the
@@ -311,6 +384,9 @@ func (c *ServicesController) applyRules(svc *v1.Service, ep *v1.Endpoints, ctx s
 	// the last place where the pod IP can still be turned back into the
 	// service IP the client's conntrack is waiting for. Without it the reply
 	// arrives with the wrong source and the client answers it with a RST.
+	// This pair is wanted again; drop any removal still queued for it.
+	c.clearWithdrawalFor(svc, ep)
+
 	failed := false
 	if err := c.Proxy.EnsureEgressSNAT(svcIP, podIP); err != nil {
 		log.Error(err, "failed to ensure egress SNAT "+ctx, "svcIP", svcIP, "podIP", podIP)
@@ -319,7 +395,9 @@ func (c *ServicesController) applyRules(svc *v1.Service, ep *v1.Endpoints, ctx s
 
 	// The destination rewrite and the port filter stay on the hosting node.
 	if !c.servesEndpoint(ep) {
-		c.withdrawIngressRules(svcIP, podIP, ctx+" (backend not on this node)")
+		if err := c.withdrawIngressRules(svcIP, podIP, ctx+" (backend not on this node)"); err != nil {
+			failed = true
+		}
 		c.recordOutcome(svc, failed)
 		return
 	}
@@ -344,24 +422,42 @@ func (c *ServicesController) recordOutcome(svc *v1.Service, failed bool) {
 	c.clearPending(svc.Namespace, svc.Name)
 }
 
+// clearWithdrawalFor drops a queued removal for a pair that has just been
+// programmed again, so the retry does not delete what was reinstalled.
+func (c *ServicesController) clearWithdrawalFor(svc *v1.Service, ep *v1.Endpoints) {
+	c.clearWithdrawal(svc.Status.LoadBalancer.Ingress[0].IP, ep.Subsets[0].Addresses[0].IP)
+}
+
 // withdrawIngressRules removes the ingress half only — destination rewrite and
 // port filter — and leaves the source rewrite in place. This is what a node
 // that does not host the backend must end up with.
-func (c *ServicesController) withdrawIngressRules(svcIP, podIP, ctx string) {
-	c.clearPortFilter(svcIP, podIP, ctx)
+// It returns an error when any part could not be removed, so the caller can
+// queue the pair for another attempt.
+func (c *ServicesController) withdrawIngressRules(svcIP, podIP, ctx string) error {
+	failed := c.clearPortFilter(svcIP, podIP, ctx)
 	if err := c.Proxy.DeleteIngressDNAT(svcIP, podIP); err != nil {
 		log.Error(err, "failed to delete ingress DNAT "+ctx, "svcIP", svcIP, "podIP", podIP)
+		failed = err
 	}
+	if failed != nil {
+		c.markWithdrawal(svcIP, podIP, false)
+	}
+	return failed
 }
 
 // withdrawRules removes every datapath entry for the pair, both halves. Used
 // when the pair itself is going away: service deleted, endpoint gone, or a pod
 // IP that has been replaced. Absent entries are not an error.
-func (c *ServicesController) withdrawRules(svcIP, podIP, ctx string) {
-	c.withdrawIngressRules(svcIP, podIP, ctx)
+func (c *ServicesController) withdrawRules(svcIP, podIP, ctx string) error {
+	failed := c.withdrawIngressRules(svcIP, podIP, ctx)
 	if err := c.Proxy.DeleteEgressSNAT(svcIP, podIP); err != nil {
 		log.Error(err, "failed to delete egress SNAT "+ctx, "svcIP", svcIP, "podIP", podIP)
+		failed = err
 	}
+	if failed != nil {
+		c.markWithdrawal(svcIP, podIP, true)
+	}
+	return failed
 }
 
 // withdrawStaleEndpoint drops the rules of a previous endpoint whose pod IP no
@@ -850,13 +946,17 @@ func (c *ServicesController) reconcilePortFilter(svc *v1.Service, svcIP, podIP, 
 
 // clearPortFilter unconditionally removes both port-filter and ICMP-allow
 // state for (svcIP, podIP). Used by delete paths.
-func (c *ServicesController) clearPortFilter(svcIP, podIP, ctx string) {
+func (c *ServicesController) clearPortFilter(svcIP, podIP, ctx string) error {
+	var failed error
 	if err := c.Proxy.DeletePortFilter(svcIP, podIP); err != nil {
 		log.Error(err, "failed to delete port filter "+ctx, "svcIP", svcIP, "podIP", podIP)
+		failed = err
 	}
 	if err := c.Proxy.DeleteICMPAllow(svcIP, podIP); err != nil {
 		log.Error(err, "failed to delete ICMP allow "+ctx, "svcIP", svcIP, "podIP", podIP)
+		failed = err
 	}
+	return failed
 }
 
 // cleanupRemovedServices performs an initial cleanup for removed services.

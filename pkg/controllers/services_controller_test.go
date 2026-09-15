@@ -53,6 +53,10 @@ type recordingProxy struct {
 	failPortFilter bool
 	// failCleanup makes CleanupRules fail.
 	failCleanup bool
+	// failDeleteEgress makes DeleteEgressSNAT fail.
+	failDeleteEgress bool
+	// failDeleteIngress makes DeleteIngressDNAT fail.
+	failDeleteIngress bool
 }
 
 func (r *recordingProxy) EnsureEgressSNAT(svcIP, podIP string) error {
@@ -65,6 +69,9 @@ func (r *recordingProxy) EnsureEgressSNAT(svcIP, podIP string) error {
 
 func (r *recordingProxy) DeleteEgressSNAT(svcIP, podIP string) error {
 	r.record("DeleteEgressSNAT")
+	if r.failDeleteEgress {
+		return errors.New("commit refused")
+	}
 	return nil
 }
 
@@ -75,6 +82,9 @@ func (r *recordingProxy) EnsureIngressDNAT(svcIP, podIP string) error {
 
 func (r *recordingProxy) DeleteIngressDNAT(svcIP, podIP string) error {
 	r.record("DeleteIngressDNAT")
+	if r.failDeleteIngress {
+		return errors.New("commit refused")
+	}
 	return nil
 }
 
@@ -338,7 +348,7 @@ func TestFailedProgrammingIsQueuedForRetry(t *testing.T) {
 	ctrl := &ServicesController{Proxy: px, NodeName: "node-a"}
 	ctrl.applyRules(svc, ep, "test")
 
-	keys, _ := ctrl.takePending()
+	keys, _, _ := ctrl.takePending()
 	if len(keys) != 1 || keys[0] != "ns/svc1" {
 		t.Fatalf("failed write must be queued, got %v", keys)
 	}
@@ -346,7 +356,7 @@ func TestFailedProgrammingIsQueuedForRetry(t *testing.T) {
 	// A clean pass clears it again.
 	px.failEgress = false
 	ctrl.applyRules(svc, ep, "test")
-	keys, _ = ctrl.takePending()
+	keys, _, _ = ctrl.takePending()
 	if len(keys) != 0 {
 		t.Errorf("clean pass must clear the queue, got %v", keys)
 	}
@@ -362,7 +372,7 @@ func TestFailedPortFilterIsQueuedForRetry(t *testing.T) {
 	ctrl := &ServicesController{Proxy: px, NodeName: "node-a"}
 	ctrl.applyRules(svc, epOnNode("10.0.0.1", "node-a"), "test")
 
-	keys, _ := ctrl.takePending()
+	keys, _, _ := ctrl.takePending()
 	if len(keys) != 1 || keys[0] != "ns/svc2" {
 		t.Fatalf("failed port filter must be queued, got %v", keys)
 	}
@@ -389,7 +399,7 @@ func TestRetryPendingReappliesDatapath(t *testing.T) {
 			t.Errorf("retry must call %s, got %v", want, px.calls)
 		}
 	}
-	if keys, _ := ctrl.takePending(); len(keys) != 0 {
+	if keys, _, _ := ctrl.takePending(); len(keys) != 0 {
 		t.Errorf("successful retry must clear the queue, got %v", keys)
 	}
 }
@@ -426,7 +436,7 @@ func TestFailedCleanupIsQueuedAndRetried(t *testing.T) {
 	if !px.has("CleanupRules") {
 		t.Errorf("cleanup must be retried, got %v", px.calls)
 	}
-	if _, pending := ctrl.takePending(); pending {
+	if _, _, pending := ctrl.takePending(); pending {
 		t.Error("successful cleanup retry must clear the flag")
 	}
 }
@@ -504,4 +514,82 @@ func TestRetryIsSerializedAgainstEndpointUpdates(t *testing.T) {
 	time.Sleep(150 * time.Millisecond)
 	close(stop)
 	wg.Wait()
+}
+
+// A withdrawal that failed cannot go through the service queue: by then the
+// service is gone from the map. Left behind, a stale pod_svc entry rewrites the
+// source of whatever pod next receives that IP.
+func TestFailedWithdrawalIsQueuedAndRetried(t *testing.T) {
+	px := &recordingProxy{failDeleteEgress: true}
+	ctrl := &ServicesController{Proxy: px, NodeName: "node-a"}
+	ctrl.Services = NewServiceMap()
+
+	if err := ctrl.withdrawRules("192.0.2.10", "10.0.0.1", "test"); err == nil {
+		t.Fatal("withdrawRules must surface the failure")
+	}
+	_, pending, _ := ctrl.takePending()
+	if len(pending) != 1 || pending[0].svcIP != "192.0.2.10" || !pending[0].egress {
+		t.Fatalf("failed withdrawal must be queued as a full one, got %+v", pending)
+	}
+
+	// Re-queue it and let the retry succeed.
+	ctrl.markWithdrawal("192.0.2.10", "10.0.0.1", true)
+	px.failDeleteEgress = false
+	px.calls = nil
+	ctrl.retryPending()
+
+	for _, want := range []string{"DeleteIngressDNAT", "DeleteEgressSNAT"} {
+		if !px.has(want) {
+			t.Errorf("retry must call %s, got %v", want, px.calls)
+		}
+	}
+	if _, pending, _ := ctrl.takePending(); len(pending) != 0 {
+		t.Errorf("successful retry must clear the queue, got %+v", pending)
+	}
+}
+
+// An endpoint that flaps back to the pod IP whose withdrawal failed must not
+// have its freshly installed rules deleted by the queued removal.
+func TestReprogrammingClearsQueuedWithdrawal(t *testing.T) {
+	svc := lbService("192.0.2.10", map[string]string{"networking.cozystack.io/wholeIP": "false"})
+	svc.Namespace, svc.Name = "ns", "svc"
+	ep := epOnNode("10.0.0.1", "node-a")
+
+	px := &recordingProxy{}
+	ctrl := &ServicesController{Proxy: px, NodeName: "node-a"}
+	ctrl.Services = NewServiceMap()
+	ctrl.markWithdrawal("192.0.2.10", "10.0.0.1", true)
+
+	ctrl.applyRules(svc, ep, "test")
+
+	if _, pending, _ := ctrl.takePending(); len(pending) != 0 {
+		t.Errorf("programming the pair again must drop its queued removal, got %+v", pending)
+	}
+}
+
+// A node that stops hosting the backend withdraws only the ingress half, and
+// must keep the cluster-wide source rewrite.
+func TestIngressOnlyWithdrawalIsQueuedWithoutEgress(t *testing.T) {
+	px := &recordingProxy{failDeleteIngress: true}
+	ctrl := &ServicesController{Proxy: px, NodeName: "node-a"}
+
+	if err := ctrl.withdrawIngressRules("192.0.2.10", "10.0.0.1", "test"); err == nil {
+		t.Fatal("withdrawIngressRules must surface the failure")
+	}
+	_, pending, _ := ctrl.takePending()
+	if len(pending) != 1 || pending[0].egress {
+		t.Fatalf("ingress-only failure must not queue an egress withdrawal, got %+v", pending)
+	}
+}
+
+// A full withdrawal supersedes an ingress-only one already queued for the pair.
+func TestFullWithdrawalSupersedesIngressOnly(t *testing.T) {
+	ctrl := &ServicesController{Proxy: &recordingProxy{}}
+	ctrl.markWithdrawal("192.0.2.10", "10.0.0.1", true)
+	ctrl.markWithdrawal("192.0.2.10", "10.0.0.1", false)
+
+	_, pending, _ := ctrl.takePending()
+	if len(pending) != 1 || !pending[0].egress {
+		t.Fatalf("full withdrawal must win, got %+v", pending)
+	}
 }
