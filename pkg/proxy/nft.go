@@ -557,6 +557,51 @@ func (p *NFTProxyProcessor) flushTolerateENOENT(op string) error {
 	return err
 }
 
+// deleteElementsTolerant removes elements from a set, falling back to one
+// commit per element when a batched commit reports that one of them is gone.
+//
+// A flush is a single nftables transaction: one missing element aborts every
+// other deletion queued with it. Tolerating that ENOENT on the batch would
+// report success while removing nothing, leaving exactly the stale state the
+// purge exists to clear — which is how a node can keep entries belonging to a
+// scope it no longer programs. Retrying per element skips only the ones that
+// really are gone.
+func (p *NFTProxyProcessor) deleteElementsTolerant(m *nftables.Set, elems []nftables.SetElement, op string) error {
+	if len(elems) == 0 {
+		return nil
+	}
+
+	if err := p.conn.SetDeleteElements(m, elems); err != nil {
+		return fmt.Errorf("failed to queue deletions for %s: %v", m.Name, err)
+	}
+	err := p.conn.Flush()
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, unix.ENOENT) {
+		return fmt.Errorf("failed to commit deletions for %s: %v", m.Name, err)
+	}
+
+	log.Info("Batched deletion hit ENOENT, retrying element by element",
+		"op", op, "set", m.Name, "elements", len(elems))
+	removed := 0
+	for _, el := range elems {
+		if err := p.conn.SetDeleteElements(m, []nftables.SetElement{el}); err != nil {
+			return fmt.Errorf("failed to queue deletion for %s: %v", m.Name, err)
+		}
+		if err := p.conn.Flush(); err != nil {
+			if errors.Is(err, unix.ENOENT) {
+				continue // already gone, nothing to do
+			}
+			return fmt.Errorf("failed to commit deletion for %s: %v", m.Name, err)
+		}
+		removed++
+	}
+	log.Info("Element-by-element deletion completed",
+		"op", op, "set", m.Name, "removed", removed, "alreadyGone", len(elems)-removed)
+	return nil
+}
+
 // CleanupRules reconciles both NAT maps against the desired state.
 //
 // keepEgress and keepIngress both map service IP → pod IP. They differ in
@@ -593,21 +638,13 @@ func (p *NFTProxyProcessor) CleanupRules(keepEgress, keepIngress map[string]stri
 	// would report that as a cleanup failure, aborting the controller at
 	// startup.
 	if len(podSvcDel) > 0 || len(svcPodDel) > 0 {
-		if len(podSvcDel) > 0 {
-			if err := p.conn.SetDeleteElements(p.podSvcMap, podSvcDel); err != nil {
-				log.Error(err, "Failed to delete stale mappings from pod_svc")
-				return fmt.Errorf("failed to delete stale mappings from pod_svc: %v", err)
-			}
+		if err := p.deleteElementsTolerant(p.podSvcMap, podSvcDel, "CleanupRules"); err != nil {
+			log.Error(err, "Failed to delete stale mappings from pod_svc")
+			return err
 		}
-		if len(svcPodDel) > 0 {
-			if err := p.conn.SetDeleteElements(p.svcPodMap, svcPodDel); err != nil {
-				log.Error(err, "Failed to delete stale mappings from svc_pod")
-				return fmt.Errorf("failed to delete stale mappings from svc_pod: %v", err)
-			}
-		}
-		if err := p.flushTolerateENOENT("CleanupRules deletions"); err != nil {
-			log.Error(err, "Failed to commit cleanup deletions")
-			return fmt.Errorf("failed to commit cleanup deletions: %v", err)
+		if err := p.deleteElementsTolerant(p.svcPodMap, svcPodDel, "CleanupRules"); err != nil {
+			log.Error(err, "Failed to delete stale mappings from svc_pod")
+			return err
 		}
 		log.Info("Stale mappings removed", "podSvc", len(podSvcDel), "svcPod", len(svcPodDel))
 	} else {
@@ -845,23 +882,14 @@ func (p *NFTProxyProcessor) CleanupPortFilters(keep map[string]PortFilterEntry) 
 		}
 	}
 
-	// 4. Batch ops.
-	if len(delPods) > 0 {
-		if err := p.conn.SetDeleteElements(p.filteredPods, delPods); err != nil {
-			return fmt.Errorf("failed to delete stale filtered_pods: %v", err)
-		}
+	// 4. Batch ops. Deletions are committed first and on their own, so an
+	// element that is already gone cannot fail the batch carrying the
+	// additions below.
+	if err := p.deleteElementsTolerant(p.filteredPods, delPods, "CleanupPortFilters"); err != nil {
+		return err
 	}
-	if len(delPorts) > 0 {
-		if err := p.conn.SetDeleteElements(p.allowedPorts, delPorts); err != nil {
-			return fmt.Errorf("failed to delete stale allowed_ports: %v", err)
-		}
-	}
-	// Commit deletions separately so an element that is already gone cannot
-	// fail the batch carrying the additions below.
-	if len(delPods) > 0 || len(delPorts) > 0 {
-		if err := p.flushTolerateENOENT("CleanupPortFilters deletions"); err != nil {
-			return fmt.Errorf("failed to flush CleanupPortFilters deletions: %v", err)
-		}
+	if err := p.deleteElementsTolerant(p.allowedPorts, delPorts, "CleanupPortFilters"); err != nil {
+		return err
 	}
 	if len(addPods) > 0 {
 		if err := p.conn.SetAddElements(p.filteredPods, addPods); err != nil {
@@ -1003,14 +1031,8 @@ func (p *NFTProxyProcessor) CleanupICMPAllow(keep map[string]string) error {
 		}
 	}
 
-	if len(delPods) > 0 {
-		if err := p.conn.SetDeleteElements(p.icmpAllowedPods, delPods); err != nil {
-			return fmt.Errorf("failed to delete stale icmp_allowed_pods: %v", err)
-		}
-		// Commit deletions separately: see flushTolerateENOENT.
-		if err := p.flushTolerateENOENT("CleanupICMPAllow deletions"); err != nil {
-			return fmt.Errorf("failed to flush CleanupICMPAllow deletions: %v", err)
-		}
+	if err := p.deleteElementsTolerant(p.icmpAllowedPods, delPods, "CleanupICMPAllow"); err != nil {
+		return err
 	}
 	if len(addPods) > 0 {
 		if err := p.conn.SetAddElements(p.icmpAllowedPods, addPods); err != nil {
