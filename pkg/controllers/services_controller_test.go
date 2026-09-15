@@ -659,3 +659,26 @@ func TestSnapshotSourceFallsBackToServiceMap(t *testing.T) {
 		t.Errorf("fallback must read the service map, got %v", got)
 	}
 }
+
+// takePending clears the cleanup flag, so a retry that fails again has to put
+// it back — otherwise the reconciliation is attempted exactly once and the
+// stale state it exists to remove stays for good.
+func TestFailedCleanupRetryIsQueuedAgain(t *testing.T) {
+	px := &recordingProxy{failCleanup: true}
+	ctrl := &ServicesController{Proxy: px, NodeName: "node-a"}
+	ctrl.Services = NewServiceMap()
+	ctrl.markCleanupPending()
+
+	ctrl.retryPending()
+	if _, _, pending := ctrl.takePending(); !pending {
+		t.Fatal("a cleanup retry that failed must be queued again")
+	}
+
+	// And it stops being queued once it succeeds.
+	ctrl.markCleanupPending()
+	px.failCleanup = false
+	ctrl.retryPending()
+	if _, _, pending := ctrl.takePending(); pending {
+		t.Error("a successful cleanup retry must clear the flag")
+	}
+}

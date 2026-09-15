@@ -276,7 +276,12 @@ func (c *ServicesController) retryPending() {
 	if cleanup {
 		log.Info("retrying startup cleanup")
 		if err := c.cleanupRemovedServices(); err != nil {
-			log.Error(err, "cleanup retry failed, will try again")
+			// takePending cleared the flag, and unlike the per-service and
+			// withdrawal paths — which re-queue themselves from inside the
+			// call that failed — nothing here would put it back. Without this
+			// the reconciliation is retried exactly once.
+			c.markCleanupPending()
+			log.Error(err, "cleanup retry failed, queued again")
 		}
 	}
 }
