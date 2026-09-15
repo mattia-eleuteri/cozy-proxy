@@ -1,6 +1,7 @@
 package controllers
 
 import (
+	"errors"
 	"testing"
 
 	v1 "k8s.io/api/core/v1"
@@ -40,10 +41,21 @@ type recordingProxy struct {
 	calls       []string
 	keepEgress  map[string]string
 	keepIngress map[string]string
+
+	// failEgress makes EnsureEgressSNAT fail, standing in for a refused
+	// nftables commit.
+	failEgress bool
+	// failPortFilter makes EnsurePortFilter fail.
+	failPortFilter bool
+	// failCleanup makes CleanupRules fail.
+	failCleanup bool
 }
 
 func (r *recordingProxy) EnsureEgressSNAT(svcIP, podIP string) error {
 	r.calls = append(r.calls, "EnsureEgressSNAT")
+	if r.failEgress {
+		return errors.New("commit refused")
+	}
 	return nil
 }
 
@@ -66,11 +78,17 @@ func (r *recordingProxy) CleanupRules(keepEgress, keepIngress map[string]string)
 	r.calls = append(r.calls, "CleanupRules")
 	r.keepEgress = keepEgress
 	r.keepIngress = keepIngress
+	if r.failCleanup {
+		return errors.New("commit refused")
+	}
 	return nil
 }
 
 func (r *recordingProxy) EnsurePortFilter(svcIP, podIP string, ports []v1.ServicePort) error {
 	r.calls = append(r.calls, "EnsurePortFilter")
+	if r.failPortFilter {
+		return errors.New("commit refused")
+	}
 	return nil
 }
 
@@ -292,5 +310,129 @@ func TestCleanupRemovedServicesScopesKeepMaps(t *testing.T) {
 	}
 	if rec.keepIngress["192.0.2.10"] != "10.0.0.1" {
 		t.Errorf("keepIngress = %v, want %v", rec.keepIngress, wantIngress)
+	}
+}
+
+// A refused commit must not be forgotten: the informers only deliver events, so
+// a service left unprogrammed would stay that way until the next one.
+func TestFailedProgrammingIsQueuedForRetry(t *testing.T) {
+	svc := lbService("192.0.2.10", map[string]string{"networking.cozystack.io/wholeIP": "false"})
+	svc.Namespace, svc.Name = "ns", "svc1"
+	ep := epOnNode("10.0.0.1", "node-a")
+
+	px := &recordingProxy{failEgress: true}
+	ctrl := &ServicesController{Proxy: px, NodeName: "node-a"}
+	ctrl.applyRules(svc, ep, "test")
+
+	keys, _ := ctrl.takePending()
+	if len(keys) != 1 || keys[0] != "ns/svc1" {
+		t.Fatalf("failed write must be queued, got %v", keys)
+	}
+
+	// A clean pass clears it again.
+	px.failEgress = false
+	ctrl.applyRules(svc, ep, "test")
+	keys, _ = ctrl.takePending()
+	if len(keys) != 0 {
+		t.Errorf("clean pass must clear the queue, got %v", keys)
+	}
+}
+
+// A port filter that could not be applied is an outage — the pod is filtered
+// with no open port — so it must be queued too.
+func TestFailedPortFilterIsQueuedForRetry(t *testing.T) {
+	svc := lbService("192.0.2.10", map[string]string{"networking.cozystack.io/wholeIP": "false"})
+	svc.Namespace, svc.Name = "ns", "svc2"
+
+	px := &recordingProxy{failPortFilter: true}
+	ctrl := &ServicesController{Proxy: px, NodeName: "node-a"}
+	ctrl.applyRules(svc, epOnNode("10.0.0.1", "node-a"), "test")
+
+	keys, _ := ctrl.takePending()
+	if len(keys) != 1 || keys[0] != "ns/svc2" {
+		t.Fatalf("failed port filter must be queued, got %v", keys)
+	}
+}
+
+// The retry pass must re-apply from the stored state.
+func TestRetryPendingReappliesDatapath(t *testing.T) {
+	svc := lbService("192.0.2.10", map[string]string{"networking.cozystack.io/wholeIP": "false"})
+	svc.Namespace, svc.Name = "ns", "svc3"
+	ep := epOnNode("10.0.0.1", "node-a")
+
+	px := &recordingProxy{failEgress: true}
+	ctrl := &ServicesController{Proxy: px, NodeName: "node-a"}
+	ctrl.Services = NewServiceMap()
+	ctrl.Services.Set("ns", "svc3", &ServiceEndpoints{Service: svc, Endpoint: ep})
+	ctrl.applyRules(svc, ep, "test")
+
+	px.failEgress = false
+	px.calls = nil
+	ctrl.retryPending()
+
+	for _, want := range []string{"EnsureEgressSNAT", "EnsureIngressDNAT", "EnsurePortFilter"} {
+		if !px.has(want) {
+			t.Errorf("retry must call %s, got %v", want, px.calls)
+		}
+	}
+	if keys, _ := ctrl.takePending(); len(keys) != 0 {
+		t.Errorf("successful retry must clear the queue, got %v", keys)
+	}
+}
+
+// A service that disappeared between the failure and the retry must not be
+// re-applied; its delete path has already withdrawn the rules.
+func TestRetryPendingSkipsVanishedService(t *testing.T) {
+	px := &recordingProxy{}
+	ctrl := &ServicesController{Proxy: px, NodeName: "node-a"}
+	ctrl.Services = NewServiceMap()
+	ctrl.markPending("ns", "gone")
+
+	ctrl.retryPending()
+	if len(px.calls) != 0 {
+		t.Errorf("vanished service must not be re-applied, got %v", px.calls)
+	}
+}
+
+// A failed startup cleanup must be re-attempted rather than wait for the next
+// event or the 12-hour informer resync.
+func TestFailedCleanupIsQueuedAndRetried(t *testing.T) {
+	px := &recordingProxy{failCleanup: true}
+	ctrl := &ServicesController{Proxy: px, NodeName: "node-a"}
+	ctrl.Services = NewServiceMap()
+
+	if err := ctrl.cleanupRemovedServices(); err == nil {
+		t.Fatal("cleanupRemovedServices must surface the failure")
+	}
+	ctrl.markCleanupPending()
+
+	px.failCleanup = false
+	px.calls = nil
+	ctrl.retryPending()
+	if !px.has("CleanupRules") {
+		t.Errorf("cleanup must be retried, got %v", px.calls)
+	}
+	if _, pending := ctrl.takePending(); pending {
+		t.Error("successful cleanup retry must clear the flag")
+	}
+}
+
+func TestSplitKey(t *testing.T) {
+	cases := []struct {
+		key, ns, name string
+		ok            bool
+	}{
+		{"ns/name", "ns", "name", true},
+		{"ns/sub/name", "ns", "sub/name", true},
+		{"noslash", "", "", false},
+		{"/name", "", "", false},
+		{"ns/", "", "", false},
+		{"", "", "", false},
+	}
+	for _, c := range cases {
+		ns, name, ok := splitKey(c.key)
+		if ok != c.ok || ns != c.ns || name != c.name {
+			t.Errorf("splitKey(%q) = (%q,%q,%v), want (%q,%q,%v)", c.key, ns, name, ok, c.ns, c.name, c.ok)
+		}
 	}
 }

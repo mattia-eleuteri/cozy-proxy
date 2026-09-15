@@ -585,6 +585,13 @@ func parsePair(svcIP, podIP string) (net.IP, net.IP, error) {
 // whole flush. Deletions must therefore be committed on their own, so a stale
 // element cannot mask a genuine failure among the additions that would
 // otherwise share the batch.
+// Note on detection: the errno travels as an *netlink.OpError wrapping a
+// syscall.Errno, which errors.Is unwraps, and that is the path taken when the
+// kernel refuses a batch. github.com/google/nftables v0.3.0 has one branch in
+// receiveAckAware that formats a trailing error ack with %v instead of wrapping
+// it, and an ENOENT arriving that way reads as an ordinary failure. v0.3.0 is
+// the latest release, so the caller is returned an error in that case rather
+// than silently continuing — which is the safe direction.
 func (p *NFTProxyProcessor) flushTolerateENOENT(op string) error {
 	err := p.conn.Flush()
 	if err == nil {
@@ -711,7 +718,10 @@ func (p *NFTProxyProcessor) CleanupRules(keepEgress, keepIngress map[string]stri
 	// Startup cleanup must not be fatal: aborting here takes the whole
 	// DaemonSet pod down and leaves the node's datapath half-programmed, while
 	// the reconcile loop would have converged on the next event anyway.
-	if err := p.flushTolerateENOENT("CleanupRules additions"); err != nil {
+	// Additions are committed strictly: an ENOENT on an addition-only batch
+	// means the table or the set is gone, so tolerating it would report a
+	// successful reconciliation with nothing installed.
+	if err := p.conn.Flush(); err != nil {
 		log.Error(err, "Failed to commit cleanup changes")
 		return fmt.Errorf("failed to commit cleanup changes: %v", err)
 	}
@@ -967,8 +977,10 @@ func (p *NFTProxyProcessor) CleanupPortFilters(keep map[string]PortFilterEntry) 
 		}
 	}
 
-	// 5. Commit the additions. Startup cleanup must not abort the pod.
-	if err := p.flushTolerateENOENT("CleanupPortFilters additions"); err != nil {
+	// 5. Commit the additions strictly: an ENOENT here means the table or the
+	// set is missing, not that an element was already gone. The caller keeps
+	// startup non-fatal.
+	if err := p.conn.Flush(); err != nil {
 		return fmt.Errorf("failed to flush CleanupPortFilters: %v", err)
 	}
 	log.Info("CleanupPortFilters completed",
@@ -1114,7 +1126,8 @@ func (p *NFTProxyProcessor) CleanupICMPAllow(keep map[string]string) error {
 		}
 	}
 
-	if err := p.flushTolerateENOENT("CleanupICMPAllow additions"); err != nil {
+	// Additions committed strictly, see CleanupPortFilters.
+	if err := p.conn.Flush(); err != nil {
 		return fmt.Errorf("failed to flush CleanupICMPAllow: %v", err)
 	}
 	log.Info("CleanupICMPAllow completed",

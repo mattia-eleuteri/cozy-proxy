@@ -3,6 +3,7 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -102,6 +103,123 @@ type ServicesController struct {
 	// to backend pods hosted here. Empty disables the check and programs
 	// everything everywhere.
 	NodeName string
+
+	// RetryInterval is how often failed datapath writes are re-attempted.
+	// Zero selects defaultRetryInterval.
+	RetryInterval time.Duration
+
+	// retryMu guards pendingServices and pendingCleanup.
+	retryMu sync.Mutex
+
+	// pendingServices holds the keys of services whose datapath programming
+	// failed. The informers only deliver events, so without a re-attempt a
+	// transient nftables failure leaves the service unprogrammed until the
+	// next event — long enough for a public IP to stay dark for minutes.
+	pendingServices map[string]struct{}
+
+	// pendingCleanup records that the startup reconciliation failed and has
+	// to run again. It stays non-fatal, but it no longer waits for the next
+	// event or the 12-hour informer resync.
+	pendingCleanup bool
+}
+
+// defaultRetryInterval is short enough that a failed write is repaired well
+// within a human noticing, and long enough that a permanent failure does not
+// flood the log.
+const defaultRetryInterval = 30 * time.Second
+
+// markPending queues a service for another programming attempt.
+func (c *ServicesController) markPending(namespace, name string) {
+	c.retryMu.Lock()
+	defer c.retryMu.Unlock()
+	if c.pendingServices == nil {
+		c.pendingServices = make(map[string]struct{})
+	}
+	c.pendingServices[makeKey(namespace, name)] = struct{}{}
+}
+
+// clearPending drops a service from the retry set after a clean pass.
+func (c *ServicesController) clearPending(namespace, name string) {
+	c.retryMu.Lock()
+	defer c.retryMu.Unlock()
+	delete(c.pendingServices, makeKey(namespace, name))
+}
+
+// markCleanupPending queues the startup reconciliation for another attempt.
+func (c *ServicesController) markCleanupPending() {
+	c.retryMu.Lock()
+	defer c.retryMu.Unlock()
+	c.pendingCleanup = true
+}
+
+// takePending returns the queued work and clears it. Anything that fails again
+// is re-queued by the attempt itself.
+func (c *ServicesController) takePending() (services []string, cleanup bool) {
+	c.retryMu.Lock()
+	defer c.retryMu.Unlock()
+	for k := range c.pendingServices {
+		services = append(services, k)
+	}
+	c.pendingServices = nil
+	cleanup = c.pendingCleanup
+	c.pendingCleanup = false
+	return services, cleanup
+}
+
+// retryPending re-attempts everything that failed since the last pass. Every
+// datapath call is idempotent, so a re-attempt on something already correct is
+// a no-op.
+func (c *ServicesController) retryPending() {
+	services, cleanup := c.takePending()
+
+	for _, key := range services {
+		ns, name, ok := splitKey(key)
+		if !ok {
+			continue
+		}
+		se, exists := c.Services.Get(ns, name)
+		if !exists || !hasValidServiceIP(se.Service) || !hasValidEndpointIP(se.Endpoint) {
+			// The service went away or lost its endpoint; the delete paths
+			// have already withdrawn its rules.
+			continue
+		}
+		log.Info("retrying datapath programming", "service", key)
+		c.applyRules(se.Service, se.Endpoint, "on retry")
+	}
+
+	if cleanup {
+		log.Info("retrying startup cleanup")
+		if err := c.cleanupRemovedServices(); err != nil {
+			log.Error(err, "cleanup retry failed, will try again")
+		}
+	}
+}
+
+// runRetryLoop re-attempts failed datapath writes until the context ends.
+func (c *ServicesController) runRetryLoop(ctx context.Context) {
+	interval := c.RetryInterval
+	if interval <= 0 {
+		interval = defaultRetryInterval
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			c.retryPending()
+		}
+	}
+}
+
+// splitKey reverses makeKey.
+func splitKey(key string) (namespace, name string, ok bool) {
+	i := strings.Index(key, "/")
+	if i <= 0 || i == len(key)-1 {
+		return "", "", false
+	}
+	return key[:i], key[i+1:], true
 }
 
 // endpointNode returns the node hosting the endpoint's first address.
@@ -156,20 +274,37 @@ func (c *ServicesController) applyRules(svc *v1.Service, ep *v1.Endpoints, ctx s
 	// the last place where the pod IP can still be turned back into the
 	// service IP the client's conntrack is waiting for. Without it the reply
 	// arrives with the wrong source and the client answers it with a RST.
+	failed := false
 	if err := c.Proxy.EnsureEgressSNAT(svcIP, podIP); err != nil {
 		log.Error(err, "failed to ensure egress SNAT "+ctx, "svcIP", svcIP, "podIP", podIP)
+		failed = true
 	}
 
 	// The destination rewrite and the port filter stay on the hosting node.
 	if !c.servesEndpoint(ep) {
 		c.withdrawIngressRules(svcIP, podIP, ctx+" (backend not on this node)")
+		c.recordOutcome(svc, failed)
 		return
 	}
 
 	if err := c.Proxy.EnsureIngressDNAT(svcIP, podIP); err != nil {
 		log.Error(err, "failed to ensure ingress DNAT "+ctx, "svcIP", svcIP, "podIP", podIP)
+		failed = true
 	}
-	c.reconcilePortFilter(svc, svcIP, podIP, ctx)
+	if err := c.reconcilePortFilter(svc, svcIP, podIP, ctx); err != nil {
+		failed = true
+	}
+	c.recordOutcome(svc, failed)
+}
+
+// recordOutcome queues the service for another attempt when any part of its
+// datapath failed, and clears a previous failure once a pass is clean.
+func (c *ServicesController) recordOutcome(svc *v1.Service, failed bool) {
+	if failed {
+		c.markPending(svc.Namespace, svc.Name)
+		return
+	}
+	c.clearPending(svc.Namespace, svc.Name)
 }
 
 // withdrawIngressRules removes the ingress half only — destination rewrite and
@@ -304,10 +439,16 @@ func (c *ServicesController) Start(ctx context.Context) error {
 	// half-programmed, whereas the informers below converge on the next event.
 	log.Info("running cleanup for removed services")
 	if err := c.cleanupRemovedServices(); err != nil {
-		log.Error(err, "cleanup of removed services failed, continuing with reconciliation")
+		log.Error(err, "cleanup of removed services failed, queued for retry")
+		c.markCleanupPending()
 	} else {
 		log.Info("cleanup of removed services completed")
 	}
+
+	// Re-attempt whatever failed. The informers only deliver events, so
+	// without this a transient nftables failure leaves a service
+	// unprogrammed until the next one.
+	go c.runRetryLoop(ctx)
 
 	<-ctx.Done()
 	log.Info("shutting down services-controller")
@@ -611,28 +752,39 @@ func allowICMP(svc *v1.Service) bool {
 // reconcilePortFilter applies the port-filter and ICMP-allow state implied by
 // the service's annotations. Call sites pass the resolved svcIP/podIP and a
 // short context string that ends up in error logs.
-func (c *ServicesController) reconcilePortFilter(svc *v1.Service, svcIP, podIP, ctx string) {
+// It returns an error when any part of the port-filter state could not be
+// applied, so the caller can queue the service for another attempt. A filtered
+// pod with missing allowed_ports drops every packet, so a silent failure here
+// is an outage.
+func (c *ServicesController) reconcilePortFilter(svc *v1.Service, svcIP, podIP, ctx string) error {
+	var failed error
 	if wholeIPPassthrough(svc) {
 		if err := c.Proxy.DeletePortFilter(svcIP, podIP); err != nil {
 			log.Error(err, "failed to delete port filter "+ctx, "svcIP", svcIP, "podIP", podIP)
+			failed = err
 		}
 		if err := c.Proxy.DeleteICMPAllow(svcIP, podIP); err != nil {
 			log.Error(err, "failed to delete ICMP allow "+ctx, "svcIP", svcIP, "podIP", podIP)
+			failed = err
 		}
-		return
+		return failed
 	}
 	if err := c.Proxy.EnsurePortFilter(svcIP, podIP, svc.Spec.Ports); err != nil {
 		log.Error(err, "failed to ensure port filter "+ctx, "svcIP", svcIP, "podIP", podIP)
+		failed = err
 	}
 	if allowICMP(svc) {
 		if err := c.Proxy.EnsureICMPAllow(svcIP, podIP); err != nil {
 			log.Error(err, "failed to ensure ICMP allow "+ctx, "svcIP", svcIP, "podIP", podIP)
+			failed = err
 		}
 	} else {
 		if err := c.Proxy.DeleteICMPAllow(svcIP, podIP); err != nil {
 			log.Error(err, "failed to delete ICMP allow "+ctx, "svcIP", svcIP, "podIP", podIP)
+			failed = err
 		}
 	}
+	return failed
 }
 
 // clearPortFilter unconditionally removes both port-filter and ICMP-allow
