@@ -10,6 +10,8 @@ import (
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	"k8s.io/client-go/tools/cache"
+
 	nat "github.com/cozystack/cozy-proxy/pkg/proxy"
 )
 
@@ -591,5 +593,69 @@ func TestFullWithdrawalSupersedesIngressOnly(t *testing.T) {
 	_, pending, _ := ctrl.takePending()
 	if len(pending) != 1 || !pending[0].egress {
 		t.Fatalf("full withdrawal must win, got %+v", pending)
+	}
+}
+
+// The startup snapshot must come from the informer stores, not from the map the
+// callbacks fill. WaitForCacheSync returns once the store is populated, not
+// once every initial callback has run, and reading the half-filled map made the
+// purge delete a live mapping it then had to wait for an event to restore.
+func TestSnapshotSourcePrefersInformerStores(t *testing.T) {
+	managed := lbService("192.0.2.10", nil)
+	managed.Namespace, managed.Name = "ns", "managed"
+	managed.Labels = map[string]string{"service.kubernetes.io/service-proxy-name": "cozy-proxy"}
+
+	unmanaged := lbService("192.0.2.11", nil)
+	unmanaged.Namespace, unmanaged.Name = "ns", "unmanaged"
+
+	noIP := &v1.Service{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "ns", Name: "noip",
+		Labels: map[string]string{"service.kubernetes.io/service-proxy-name": "cozy-proxy"},
+	}}
+
+	noEndpoint := lbService("192.0.2.12", nil)
+	noEndpoint.Namespace, noEndpoint.Name = "ns", "noep"
+	noEndpoint.Labels = map[string]string{"service.kubernetes.io/service-proxy-name": "cozy-proxy"}
+
+	svcStore := cache.NewStore(cache.MetaNamespaceKeyFunc)
+	for _, s := range []*v1.Service{managed, unmanaged, noIP, noEndpoint} {
+		if err := svcStore.Add(s); err != nil {
+			t.Fatalf("seeding service store: %v", err)
+		}
+	}
+
+	ep := epOnNode("10.0.0.1", "node-a")
+	ep.Namespace, ep.Name = "ns", "managed"
+	epStore := cache.NewStore(cache.MetaNamespaceKeyFunc)
+	if err := epStore.Add(ep); err != nil {
+		t.Fatalf("seeding endpoint store: %v", err)
+	}
+
+	ctrl := &ServicesController{Proxy: &recordingProxy{}, svcStore: svcStore, epStore: epStore}
+	// Deliberately empty: this is the map the callbacks had not filled yet.
+	ctrl.Services = NewServiceMap()
+
+	got := ctrl.snapshotSource()
+	if len(got) != 1 {
+		t.Fatalf("snapshot must hold only the managed service with a valid IP and endpoint, got %d: %v", len(got), got)
+	}
+	se, ok := got["ns/managed"]
+	if !ok || se.Service.Name != "managed" || se.Endpoint.Subsets[0].Addresses[0].IP != "10.0.0.1" {
+		t.Errorf("unexpected snapshot entry: %+v", got)
+	}
+}
+
+// Without informers the controller still has to work, which is how the unit
+// tests drive it.
+func TestSnapshotSourceFallsBackToServiceMap(t *testing.T) {
+	svc := lbService("192.0.2.10", nil)
+	svc.Namespace, svc.Name = "ns", "svc"
+
+	ctrl := &ServicesController{Proxy: &recordingProxy{}}
+	ctrl.Services = NewServiceMap()
+	ctrl.Services.Set("ns", "svc", &ServiceEndpoints{Service: svc, Endpoint: epOnNode("10.0.0.1", "node-a")})
+
+	if got := ctrl.snapshotSource(); len(got) != 1 {
+		t.Errorf("fallback must read the service map, got %v", got)
 	}
 }

@@ -120,6 +120,15 @@ type ServicesController struct {
 	// everything everywhere.
 	NodeName string
 
+	// svcStore and epStore are the informer stores. The startup snapshot is
+	// built from them rather than from Services, because WaitForCacheSync
+	// returns once the store is populated, not once every initial callback
+	// has run. Reading the half-filled map made the purge treat a live
+	// mapping as stale and delete it, leaving the node without it until an
+	// event happened to re-apply that service — or until the 12-hour resync.
+	svcStore cache.Store
+	epStore  cache.Store
+
 	// RetryInterval is how often failed datapath writes are re-attempted.
 	// Zero selects defaultRetryInterval.
 	RetryInterval time.Duration
@@ -509,6 +518,8 @@ func (c *ServicesController) Start(ctx context.Context) error {
 		},
 	)
 
+	c.svcStore = serviceInformer.GetStore()
+
 	serviceInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    c.addServiceFunc,
 		DeleteFunc: c.deleteServiceFunc,
@@ -550,6 +561,8 @@ func (c *ServicesController) Start(ctx context.Context) error {
 			},
 		},
 	)
+
+	c.epStore = endpointsInformer.GetStore()
 
 	endpointsInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    c.addEndpointFunc,
@@ -959,6 +972,36 @@ func (c *ServicesController) clearPortFilter(svcIP, podIP, ctx string) error {
 	return failed
 }
 
+// snapshotSource returns the pairs the datapath should hold.
+//
+// It reads the informer stores when they are available, because they are
+// authoritative as soon as WaitForCacheSync returns, whereas Services is
+// filled by callbacks that may not have run yet. Falling back to Services
+// keeps the controller usable without informers, which is how the unit tests
+// drive it.
+func (c *ServicesController) snapshotSource() map[string]*ServiceEndpoints {
+	if c.svcStore == nil || c.epStore == nil {
+		return c.Services.GetAll()
+	}
+	out := make(map[string]*ServiceEndpoints)
+	for _, obj := range c.svcStore.List() {
+		svc, ok := obj.(*v1.Service)
+		if !ok || !isCozyProxyService(svc) || !hasValidServiceIP(svc) {
+			continue
+		}
+		epObj, exists, err := c.epStore.GetByKey(makeKey(svc.Namespace, svc.Name))
+		if err != nil || !exists {
+			continue
+		}
+		ep, ok := epObj.(*v1.Endpoints)
+		if !ok || !hasValidEndpointIP(ep) {
+			continue
+		}
+		out[makeKey(svc.Namespace, svc.Name)] = &ServiceEndpoints{Service: svc, Endpoint: ep}
+	}
+	return out
+}
+
 // cleanupRemovedServices performs an initial cleanup for removed services.
 func (c *ServicesController) cleanupRemovedServices() error {
 	// Reconciliations are serialized end to end, see reconcileMu.
@@ -972,8 +1015,7 @@ func (c *ServicesController) cleanupRemovedServices() error {
 	// scoped both maps alike.
 	keepEgress := make(map[string]string)
 	keepIngress := make(map[string]string)
-	// Get a snapshot of all managed services.
-	allServices := c.Services.GetAll()
+	allServices := c.snapshotSource()
 	for _, serviceEndpoints := range allServices {
 		if serviceEndpoints.Service == nil || serviceEndpoints.Endpoint == nil {
 			continue
