@@ -353,6 +353,14 @@ commit, so no new flow can be created towards a backend that was just purged.
   startup, which is the rollback path for the whole mode.
 - Nothing on the L4 side stops the process: the VM mode runs in the same
   manager. Without `NODE_NAME`, or while the MetalLB CRD is missing, the mode
+- An instance with the mode disabled must not delete the table of another
+  instance on the same node that runs it, as when the L4 mode is tried as a
+  second release next to the platform's cozy-proxy: the table would only come
+  back with the owner's next forced resync, up to a minute later, with neither
+  guard nor translation for the VIPs in between. That instance runs with
+  `--remove-l4-table-when-disabled=false` (chart:
+  `l4LoadBalancer.removeTableWhenDisabled`) and leaves the table untouched, as
+  an instance with the VM mode off leaves `cozy_proxy`.
   logs and stays idle.
 
 ### 4.5 Announcer changes
