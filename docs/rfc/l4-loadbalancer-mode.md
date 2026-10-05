@@ -191,8 +191,10 @@ table ip cozy_proxy_l4 {
 	set node_ips { type ipv4_addr }
 	# (backend IP, protocol, backend port) of every local target, announcer only.
 	set backends { type ipv4_addr . inet_proto . inet_service }
-	# One map per announced service port: round-robin slot -> backend.
-	map backends-<ns>/<svc>/tcp/<port> { type integer : ipv4_addr . inet_service }
+	# One map per announced frontend: round-robin slot -> backend, commented
+	# with the service's namespace/name. nft lists the key type as "type 0"
+	# (see addBackendMap).
+	map backends-<VIP>-tcp-<port> { type integer : ipv4_addr . inet_service }
 
 	chain guard {
 		type filter hook prerouting priority mangle + 10; policy accept;
@@ -203,7 +205,7 @@ table ip cozy_proxy_l4 {
 	chain translate {
 		type nat hook prerouting priority dstnat - 5; policy accept;
 		# announcer only, one rule per (VIP, port)
-		ip daddr <VIP> tcp dport <port> dnat ip addr . port to numgen inc mod <n> map @backends-<ns>/<svc>/tcp/<port>
+		ip daddr <VIP> tcp dport <port> dnat ip to numgen inc mod <n> map @backends-<VIP>-tcp-<port>
 		# announcer with no ready local backend for that port
 		ip daddr <VIP> tcp dport <port> drop
 	}
@@ -351,8 +353,6 @@ commit, so no new flow can be created towards a backend that was just purged.
 - The mode is behind `--enable-l4-loadbalancer` (chart:
   `l4LoadBalancer.enabled`), off by default. Disabling it deletes the table at
   startup, which is the rollback path for the whole mode.
-- Nothing on the L4 side stops the process: the VM mode runs in the same
-  manager. Without `NODE_NAME`, or while the MetalLB CRD is missing, the mode
 - An instance with the mode disabled must not delete the table of another
   instance on the same node that runs it, as when the L4 mode is tried as a
   second release next to the platform's cozy-proxy: the table would only come
@@ -361,6 +361,8 @@ commit, so no new flow can be created towards a backend that was just purged.
   `--remove-l4-table-when-disabled=false` (chart:
   `l4LoadBalancer.removeTableWhenDisabled`) and leaves the table untouched, as
   an instance with the VM mode off leaves `cozy_proxy`.
+- Nothing on the L4 side stops the process: the VM mode runs in the same
+  manager. Without `NODE_NAME`, or while the MetalLB CRD is missing, the mode
   logs and stays idle.
 
 ### 4.5 Announcer changes
