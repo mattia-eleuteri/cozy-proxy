@@ -39,11 +39,16 @@ func main() {
 	var metricsAddr string
 	var enableL4 bool
 	var enableVM bool
+	var removeL4Table bool
 	flag.StringVar(&probeAddr, "health-probe-bind-address", "0", "The address the probe endpoint binds to. Set to \"0\" to disable.")
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metric endpoint binds to. Set to \"0\" to disable.")
 	flag.BoolVar(&enableL4, "enable-l4-loadbalancer", false,
 		"Run the L4 LoadBalancer mode for services labelled "+l4.ProxyLabel+"="+l4.ProxyLabelValue+
-			" (see docs/rfc/l4-loadbalancer-mode.md). When false, a table left by an earlier run is removed.")
+			" (see docs/rfc/l4-loadbalancer-mode.md).")
+	flag.BoolVar(&removeL4Table, "remove-l4-table-when-disabled", true,
+		"With the L4 mode disabled, remove the table left by an earlier run, which is how the mode is rolled back. "+
+			"Turn it off on an instance that runs next to another cozy-proxy running the L4 mode: "+
+			"each of its starts would delete that instance's table.")
 	flag.BoolVar(&enableVM, "enable-vm-mode", true,
 		"Run the VM mode for services labelled service.kubernetes.io/service-proxy-name=cozy-proxy. "+
 			"Turn it off only for an instance running the L4 mode next to another cozy-proxy that keeps the VM mode.")
@@ -110,7 +115,7 @@ func main() {
 		log.Info("VM mode disabled, the cozy_proxy table is left untouched")
 	}
 
-	setupL4(mgr, l4Cfg, enableL4, nodeName)
+	setupL4(mgr, l4Cfg, enableL4, removeL4Table, nodeName)
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		log.Error(err, "unable to set up health check")
@@ -128,12 +133,17 @@ func main() {
 	}
 }
 
-// setupL4 adds the L4 LoadBalancer mode to the manager, or removes what an
-// earlier run of it left when it is disabled. Nothing here may stop the
+// setupL4 adds the L4 LoadBalancer mode to the manager. When it is disabled,
+// it removes what an earlier run left if removeTable is set, and otherwise
+// leaves the table to the instance that owns it. Nothing here may stop the
 // process: the VM mode runs in the same manager.
-func setupL4(mgr ctrl.Manager, cfg *rest.Config, enabled bool, nodeName string) {
+func setupL4(mgr ctrl.Manager, cfg *rest.Config, enabled, removeTable bool, nodeName string) {
 	datapath := &proxy.NFTL4Datapath{}
 	if !enabled {
+		if !removeTable {
+			log.Info("L4 mode disabled, the " + proxy.L4TableName + " table is left untouched")
+			return
+		}
 		if err := datapath.Teardown(); err != nil {
 			log.Error(err, "could not remove the L4 table left by an earlier run")
 		}
