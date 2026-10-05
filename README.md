@@ -103,9 +103,9 @@ spec:
   externalTrafficPolicy: Local
 ```
 
-The node MetalLB (L2) announces the VIP from DNATs new connections to its local
-ready backends, masquerading only sources that are node IPs; everything else
-addressed to the VIP is dropped. The mode has its own table, `ip
+The node from which MetalLB (L2) announces the VIP DNATs new connections to its
+local ready backends, masquerading only sources that are node IPs; everything
+else addressed to the VIP is dropped. The mode has its own table, `ip
 cozy_proxy_l4`, and never touches the VM mode's. It is off by default: run with
 `--enable-l4-loadbalancer` (chart value `l4LoadBalancer.enabled`). Phase 1
 handles TCP, IPv4 and `externalTrafficPolicy: Local`.
