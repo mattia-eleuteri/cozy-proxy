@@ -405,8 +405,9 @@ Consequences:
   platform's `infraLabels`. cozy-proxy requires the
   `networking.cozystack.io/lb-proxy` label (2.5), so the annotation alone never
   makes it program anything. At worst a tenant copying `service.cilium.io/type:
-  ClusterIP` makes its own LB dark (Cilium lets go, nobody takes over); the
-  Kyverno guard of 7.1 refuses such a Service in the first place.
+  ClusterIP` makes its own LB dark (Cilium lets go, nobody takes over); an
+  admission guard on CCM Services (7.1), where the platform runs one, refuses
+  such a Service in the first place.
 - **What the tenant still controls on an L4 CCM Service**: the ports (the CCM
   copies them) and `externalTrafficPolicy`. A tenant Service in eTP `Cluster`
   that the platform labelled anyway would be refused by cozy-proxy and stay
@@ -438,15 +439,17 @@ enabled per environment.
 | Ingress | `packages/extra/ingress/templates/nginx-ingress.yaml` | `controller.service.labels` / `annotations`; eTP is already `Local`. The host ingress (`tenant-root`) with PROXY protocol and ouroboros is last, see Open questions. |
 | cozy-proxy | `packages/system/cozy-proxy` | bump the vendored chart, enable the mode, extend RBAC (EndpointSlices, Nodes, ServiceL2Status) |
 
-### 7.1 Coexistence with the Kyverno guard on CCM Services
+### 7.1 Coexistence with an admission guard on CCM Services
 
-The policy `ccm-lb-tenant-fields-guard` (hikube-gitops !121, `Audit` when
-proposed) refuses, on CREATE and UPDATE, any Service carrying
-`cluster.x-k8s.io/tenant-service-name` that has `spec.externalIPs` or one of a
-list of MetalLB, external-dns and Cilium annotations, `service.cilium.io/type`
-included: a tenant must not drive them through the CCM's copy. As proposed, it
-refuses an L4 CCM Service at creation, and refuses the one-shot migration patch,
-which turns a compliant Service into a violating one.
+Because the CCM copies every annotation of the tenant Service onto the infra
+Service, a platform may run an admission guard against it. The one considered
+here is a Kyverno `ClusterPolicy`: on CREATE and UPDATE, it refuses any Service
+carrying `cluster.x-k8s.io/tenant-service-name` that has `spec.externalIPs` or
+one of a list of MetalLB, external-dns and Cilium annotations,
+`service.cilium.io/type` included, so that a tenant cannot drive them through
+the CCM's copy. Such a guard, written that way, refuses an L4 CCM Service at
+creation, and refuses the one-shot migration patch, which turns a compliant
+Service into a violating one.
 
 It does not refuse the UPDATEs that follow. Kyverno admits any UPDATE of an
 object that already violates the rule (`validate.allowExistingViolations`,
@@ -585,11 +588,11 @@ another tenant, the source IP logged by the backend, MetalLB announcer, and the
 9. **Observability**: metrics (sync duration and errors, programmed services,
    purged flows) and Events on the Service when it is refused. Phase 1 only
    logs, once per change.
-10. **Kyverno guard (7.1)**: the narrowed rule was tested on the lab on
-    2026-10-02 (Kyverno 1.18.2): a real CCM CREATE and port UPDATE, the
-    migration patch, a tenant copy without the label, another
-    `service.cilium.io/*` key, and the rollback in both orders. It still has to
-    be agreed with the owners of hikube-gitops !121.
+10. **Admission guard on CCM Services (7.1)**: the narrowed rule was tested on
+    the lab on 2026-10-02 (Kyverno 1.18.2): a real CCM CREATE and port UPDATE,
+    the migration patch, a tenant copy without the label, another
+    `service.cilium.io/*` key, and the rollback in both orders. Cozystack does
+    not ship such a guard today: should it, and in which package?
 11. **Where the label lives**: `networking.cozystack.io/lb-proxy: cozy-proxy` is a
     proposal; the maintainers may prefer another key.
 12. **Purging the TCP flows of a backend that is still alive — decided.** Aligned
