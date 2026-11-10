@@ -118,8 +118,9 @@ func TestBuildAnnouncedServiceUsesLocalReadyBackends(t *testing.T) {
 	}
 }
 
-// Only the announcer translates. Every other node still guards the VIP, and
-// lets declared ports through so that its pods' packets reach the announcer.
+// A node that neither announces the VIP in L2 nor hosts a backend only guards
+// it, and lets declared ports through so that its pods' packets reach a node
+// that translates.
 func TestBuildNotAnnouncedServiceIsGuardedOnly(t *testing.T) {
 	svc := l4Service("ns", "pg", "192.0.2.10")
 	svc.Spec.Ports = []v1.ServicePort{svcPort("pg", 5432)}
@@ -128,17 +129,47 @@ func TestBuildNotAnnouncedServiceIsGuardedOnly(t *testing.T) {
 		NodeName: thisNode,
 		Services: []*v1.Service{svc},
 		EndpointSlices: []*discoveryv1.EndpointSlice{slice("ns", "pg", "pg-1",
-			[]discoveryv1.EndpointPort{epPort("pg", 5432)}, endpoint("10.0.0.1", thisNode))},
+			[]discoveryv1.EndpointPort{epPort("pg", 5432)}, endpoint("10.0.0.1", "node-b"))},
 	})
 
 	if len(got.Rules) != 0 {
-		t.Errorf("a node that does not announce the VIP must not translate it, got %+v", got.Rules)
+		t.Errorf("a node without L2 announcement nor local backend must not translate, got %+v", got.Rules)
 	}
 	if !reflect.DeepEqual(got.VIPs, []netip.Addr{addr("192.0.2.10")}) {
 		t.Errorf("VIPs = %v, want the service VIP", got.VIPs)
 	}
 	if !reflect.DeepEqual(got.Ports, []PortKey{key("192.0.2.10", 5432)}) {
 		t.Errorf("Ports = %v, want the declared port", got.Ports)
+	}
+}
+
+// In BGP mode with externalTrafficPolicy Local, MetalLB announces the VIP from
+// every node with a ready backend, not only from the L2 announcer, and the
+// routers spread flows across them. Such a node must translate to its local
+// backends, or the flows it receives leave untranslated for the gateway. A
+// port without a local backend stays untranslated on it: it is not announced
+// from there.
+func TestBuildBGPNodeWithLocalBackendTranslates(t *testing.T) {
+	svc := l4Service("ns", "web", "192.0.2.10")
+	svc.Spec.Ports = []v1.ServicePort{svcPort("http", 80), svcPort("metrics", 9100)}
+
+	got, _ := Build(Input{
+		NodeName: thisNode,
+		Services: []*v1.Service{svc},
+		EndpointSlices: []*discoveryv1.EndpointSlice{slice("ns", "web", "web-1",
+			[]discoveryv1.EndpointPort{epPort("http", 30593)},
+			endpoint("10.0.0.1", thisNode),
+			endpoint("10.0.0.2", "node-b"))},
+		// node-b is the L2 announcer: this node is not in Announced.
+	})
+
+	want := []Rule{{PortKey: key("192.0.2.10", 80), Service: "ns/web",
+		Backends: []Backend{be("10.0.0.1", 30593)}}}
+	if !reflect.DeepEqual(got.Rules, want) {
+		t.Errorf("Rules =\n%+v\nwant\n%+v", got.Rules, want)
+	}
+	if !reflect.DeepEqual(got.Ports, []PortKey{key("192.0.2.10", 80), key("192.0.2.10", 9100)}) {
+		t.Errorf("Ports = %v, want both declared ports", got.Ports)
 	}
 }
 

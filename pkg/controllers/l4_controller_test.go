@@ -232,8 +232,9 @@ func TestL4SyncPurgesTCPFlowsWithTheirFrontendOnly(t *testing.T) {
 		t.Errorf("withdrawing a TCP backend must not purge, got %d purges, purged %+v", ct.calls, ct.purged)
 	}
 
-	// The node stops announcing the service: every flow through it goes.
-	gone := l4Input(l4Slice("pg", "10.0.0.1", "10.0.0.3"))
+	// The node stops translating the service, having lost both the L2
+	// announcement and its local backends: every flow through it goes.
+	gone := l4Input(l4Slice("pg"))
 	gone.Announced = nil
 	if err := c.syncWith(gone, false); err != nil {
 		t.Fatalf("sync: %v", err)
@@ -323,7 +324,7 @@ func TestL4ControllerProgramsFromTheAPI(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: l4Node},
 		Status:     v1.NodeStatus{Addresses: []v1.NodeAddress{{Type: v1.NodeInternalIP, Address: "10.200.24.11"}}},
 	}
-	cs := fake.NewSimpleClientset(l4Svc("pg", "192.0.2.10"), l4Slice("pg", "10.0.0.1"), node)
+	cs := fake.NewSimpleClientset(l4Svc("pg", "192.0.2.10"), l4Slice("pg"), node)
 	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(),
 		map[schema.GroupVersionResource]string{l2StatusGVR: "ServiceL2StatusList"},
 		// Another node's status must not make this node an announcer.
@@ -354,15 +355,23 @@ func TestL4ControllerProgramsFromTheAPI(t *testing.T) {
 	}
 	waitFor(t, dp, "the VIP guarded but not translated", notAnnounced)
 
-	// MetalLB elects this node.
+	// A local backend appears while another node holds the L2 announcement:
+	// in BGP mode this node announces the VIP too, so it translates.
+	if _, err := cs.DiscoveryV1().EndpointSlices("ns").Update(ctx, l4Slice("pg", "10.0.0.1"), metav1.UpdateOptions{}); err != nil {
+		t.Fatalf("updating the EndpointSlice: %v", err)
+	}
+	translated := func(st l4.State) bool {
+		return len(st.Rules) == 1 && len(st.Rules[0].Backends) == 1 &&
+			st.Rules[0].Backends[0].IP == netip.MustParseAddr("10.0.0.1")
+	}
+	waitFor(t, dp, "the VIP translated to the local backend without L2 announcement", translated)
+
+	// MetalLB elects this node in L2: still translated.
 	if _, err := dyn.Resource(l2StatusGVR).Namespace("metallb-system").Create(ctx,
 		l2Status("l2-here", l4Node, "ns", "pg"), metav1.CreateOptions{}); err != nil {
 		t.Fatalf("creating the ServiceL2Status: %v", err)
 	}
-	waitFor(t, dp, "the VIP translated to the local backend", func(st l4.State) bool {
-		return len(st.Rules) == 1 && len(st.Rules[0].Backends) == 1 &&
-			st.Rules[0].Backends[0].IP == netip.MustParseAddr("10.0.0.1")
-	})
+	waitFor(t, dp, "the VIP translated to the local backend", translated)
 
 	// The backend goes away.
 	if _, err := cs.DiscoveryV1().EndpointSlices("ns").Update(ctx, l4Slice("pg"), metav1.UpdateOptions{}); err != nil {

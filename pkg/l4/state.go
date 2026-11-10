@@ -135,6 +135,12 @@ func (b *builder) addService(svc *v1.Service) {
 		return
 	}
 
+	// The L2 announcer translates every port, even one without a local
+	// backend, whose empty rule then drops instead of looping. Any other node
+	// translates a port as soon as it hosts a ready backend for it: with
+	// externalTrafficPolicy Local, MetalLB in BGP mode announces the VIP from
+	// every such node and the routers spread flows across them (ECMP), so an
+	// untranslated packet would leave for the default gateway.
 	announced := b.in.Announced[key]
 	for _, sp := range svc.Spec.Ports {
 		proto := sp.Protocol
@@ -145,9 +151,10 @@ func (b *builder) addService(svc *v1.Service) {
 			b.notice(key, "port %s/%d not programmed: only TCP is supported", proto, sp.Port)
 			continue
 		}
-		var backends, draining []Backend
-		if announced {
-			backends, draining = b.localBackends(key, svc.Namespace, svc.Name, sp.Name, proto)
+		backends, draining := b.localBackends(key, svc.Namespace, svc.Name, sp.Name, proto)
+		translate := announced || len(backends) > 0
+		if !translate {
+			backends, draining = nil, nil
 		}
 		for _, vip := range vips {
 			pk := PortKey{VIP: vip, Protocol: proto, Port: uint16(sp.Port)}
@@ -157,7 +164,7 @@ func (b *builder) addService(svc *v1.Service) {
 			}
 			b.owner[pk] = key
 			b.st.Ports = append(b.st.Ports, pk)
-			if announced {
+			if translate {
 				b.st.Rules = append(b.st.Rules, Rule{PortKey: pk, Service: key, Backends: backends, Draining: draining})
 			}
 		}
