@@ -63,6 +63,12 @@ public IP is reachable from every tenant, with the client seen as `world`.
    which reverses the translation. Services must use
    `externalTrafficPolicy: Local`, which is also what makes MetalLB pick an
    announcer that has a local backend.
+   Any other node that hosts a ready backend translates the same way. With
+   MetalLB in BGP mode, `externalTrafficPolicy: Local` makes every such node
+   announce the VIP, and the upstream routers spread flows across them (ECMP);
+   a node translating only as the L2 announcer would forward the flows hashed
+   to it, untranslated, to its default gateway. A node that announces nothing
+   receives no traffic for the VIP, so translating there is harmless.
 2. **Masquerade only sources that are node IPs.** An in-cluster pod reaching the
    VIP from another node is masqueraded by kube-ovn to *its node's* IP before
    leaving that node. If the announcer forwarded that packet unchanged, the
@@ -165,7 +171,7 @@ there.
 | Address family | IPv4 | IPv6 |
 | Ports / backends | many / many | |
 | Endpoints | EndpointSlices, ready, local | terminating fallback |
-| Announcer source | MetalLB L2 `ServiceL2Status` | BGP, other LB providers |
+| Announcer source | MetalLB L2 `ServiceL2Status`, or a local ready backend (BGP) | other LB providers |
 
 A labelled and annotated service that is not supported (for example
 `externalTrafficPolicy: Cluster`) is **not** programmed, but its VIP is still
