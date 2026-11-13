@@ -29,33 +29,6 @@ import (
 //	go test ./pkg/proxy -run TestL4 -update
 var updateGolden = flag.Bool("update", false, "rewrite the golden files under testdata")
 
-// scratchNetns creates a network namespace that lives as long as the test, so
-// nothing here ever touches the host's ruleset.
-func scratchNetns(t *testing.T) netns.NsHandle {
-	t.Helper()
-	if os.Geteuid() != 0 {
-		t.Skip("needs root to create a network namespace")
-	}
-
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-
-	orig, err := netns.Get()
-	if err != nil {
-		t.Fatalf("netns.Get: %v", err)
-	}
-	defer func() { _ = orig.Close() }()
-	ns, err := netns.New() // also switches this thread into it
-	if err != nil {
-		t.Skipf("cannot create a network namespace: %v", err)
-	}
-	if err := netns.Set(orig); err != nil {
-		t.Fatalf("netns.Set: %v", err)
-	}
-	t.Cleanup(func() { _ = ns.Close() })
-	return ns
-}
-
 func datapathIn(ns netns.NsHandle) *NFTL4Datapath {
 	return &NFTL4Datapath{ConnOptions: []nftables.ConnOption{nftables.WithNetNSFd(int(ns))}}
 }
