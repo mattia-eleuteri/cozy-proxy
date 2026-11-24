@@ -54,7 +54,8 @@ public IP is reachable from every tenant, with the client seen as `world`.
                        MetalLB L2 announcer of the VIP (node N)
  client ──► VIP:port ──► guard ──► DNAT to a *local* ready backend (conntrack)
                                     └─ if the source is a node IP: masquerade
-                         ◄────────── un-NAT by conntrack on the reply ◄── backend
+                         ◄── source set back to the VIP before routing ◄── backend
+                             (then un-NAT by conntrack, a no-op on the source)
 ```
 
 1. **DNAT, stateful, on the announcer only.** The node MetalLB elected to answer
@@ -86,6 +87,20 @@ public IP is reachable from every tenant, with the client seen as `world`.
    more (Cilium released it), and the announcer forwards it to its default
    gateway, which sends it straight back: a routing loop until the TTL expires.
    This was observed on the lab.
+5. **Replies are routed from the VIP.** Conntrack reverses the DNAT only in
+   postrouting, after the routing decision, so a reply would be routed with the
+   backend's address as source. Hikube nodes route by source: traffic from a
+   public pool leaves through that pool's uplink, everything else through the
+   node's default gateway. A reply to a preserved source (point 3) would then
+   leave through the default gateway, while the client — a VM whose public IP
+   is on the same L2 as the VIP — sent its SYN straight to the announcer. A
+   stateful gateway drops that SYN-ACK, having never seen the SYN, and the
+   connection never opens (production, 2026-11-24: GitLab VM to a tenant
+   ingress on another node). The L4 mode therefore marks each flow with its VIP
+   and writes the VIP back as the reply's source before routing, as Cilium did
+   by reversing its translation before the route lookup, and as the VM mode
+   does for its own addresses at `raw`. Masqueraded flows (point 2) are left
+   alone: their reply goes to a node, which the VIP's routes do not reach.
 
 Observed on the lab with this model (3 nodes, kube-ovn + Cilium chaining,
 MetalLB L2):
@@ -96,6 +111,11 @@ MetalLB L2):
 | pod on another node | OK | `100.64.0.x` of the announcer, identity `world` |
 | VM on another node (cozy-proxy VM service) | OK | the VM's public IP |
 | Internet | OK | the client's real IP |
+
+The VM row passed on the lab before point 5 existed only because the lab's
+default gateway forwards the misrouted SYN-ACK without tracking state. Its
+captures show the same asymmetry as production; with point 5 the SYN-ACK
+leaves on the VIP's VLAN, straight to the client's node.
 
 ### 2.2 Rejected: DNAT on the announcer without masquerade (E1)
 
@@ -201,6 +221,9 @@ table ip cozy_proxy_l4 {
 	# with the service's namespace/name. nft lists the key type as "type 0"
 	# (see addBackendMap).
 	map backends-<VIP>-tcp-<port> { type integer : ipv4_addr . inet_service }
+	# Every VIP, keyed by the conntrack mark translate gives its flows: the
+	# VIP itself as an integer (192.0.2.10 is 0xc000020a).
+	map vip_by_mark { type mark : ipv4_addr }
 
 	chain guard {
 		type filter hook prerouting priority mangle + 10; policy accept;
@@ -208,10 +231,15 @@ table ip cozy_proxy_l4 {
 		ip daddr @vips ip daddr . meta l4proto . th dport != @vip_ports drop
 	}
 
+	chain unnat {
+		type filter hook prerouting priority -139; policy accept;
+		ct direction reply ct status & (snat | dnat) == dnat ip saddr set ct mark map @vip_by_mark
+	}
+
 	chain translate {
 		type nat hook prerouting priority dstnat - 5; policy accept;
 		# announcer only, one rule per (VIP, port)
-		ip daddr <VIP> tcp dport <port> dnat ip to numgen inc mod <n> map @backends-<VIP>-tcp-<port>
+		ip daddr <VIP> tcp dport <port> ct mark set <VIP as integer> dnat ip to numgen inc mod <n> map @backends-<VIP>-tcp-<port>
 		# announcer with no ready local backend for that port
 		ip daddr <VIP> tcp dport <port> drop
 	}
@@ -230,7 +258,19 @@ Notes:
   translated with it. New packets to a VIP on an undeclared (VIP, protocol,
   port) are dropped, which includes ICMP echo: nobody would answer it anyway.
 - `translate` only holds rules on the announcer. Elsewhere the packet is left alone
-  and routed out, to the announcer.
+  and routed out, to the announcer. Each rule marks the flow with its VIP
+  before translating it. The mark cannot be set by a later nat chain: once a
+  chain has set up the flow's NAT, the hook skips every following nat chain.
+- `unnat` writes the VIP back as the source of every reply of a flow this table
+  translated and did not masquerade, before the routing decision (2.1, point
+  5). The rewrite is stateless; conntrack's own reverse translation in
+  postrouting then finds the source already in place. The VIP comes from the
+  flow's mark rather than from `ct original ip daddr`, which
+  `github.com/google/nftables` cannot emit (see `masq` below). Production and
+  lab conntrack carried no mark before the L4 mode (every entry at `mark=0`,
+  OVS zones included), so the mode takes the whole 32 bits. A flow opened
+  before this chain existed has no mark, matches no element, and keeps its
+  former path.
 - `masq` only matches flows this node translated (`ct status dnat`) towards one
   of its L4 targets, from a node IP, so a node process talking to a backend pod
   directly (a kubelet probe) keeps its source. The masquerade picks the address
@@ -254,7 +294,8 @@ Notes:
 | -200 | prerouting | | conntrack | flow lookup / creation |
 | -150 (mangle) | prerouting | `cozy_proxy` | `ingress_dnat` | VM mode: stateless destination rewrite VM VIP -> pod IP |
 | -140 | prerouting | `cozy_proxy_l4` | `guard` | L4: drop undeclared traffic to L4 VIPs |
-| -105 | prerouting | `cozy_proxy_l4` | `translate` | L4: stateful DNAT, first packet only |
+| -139 | prerouting | `cozy_proxy_l4` | `unnat` | L4: stateless source rewrite backend -> VIP on replies, before routing |
+| -105 | prerouting | `cozy_proxy_l4` | `translate` | L4: mark the flow with its VIP, stateful DNAT, first packet only |
 | -100 | prerouting | | kube-ovn / iptables nat | unchanged |
 | 0 (filter) | prerouting | `cozy_proxy` | `port_filter` | VM mode: per-port filter on VM pod IPs |
 | 95 | postrouting | `cozy_proxy_l4` | `masq` | L4: masquerade node sources |
@@ -263,8 +304,9 @@ The two modes act on disjoint destination addresses (VM VIPs vs L4 VIPs), so
 they do not see each other's packets, with one exception: a VM client of an L4
 service. Its packet leaves its node with the VM's VIP as source (rewritten at
 `raw`, before conntrack), is not masqueraded by the announcer (not a node IP),
-and the reply comes back to the VM's node as an ordinary packet to the VM VIP.
-That is the lab-validated path.
+and the reply comes back to the VM's node as an ordinary packet to the VM VIP —
+provided the announcer routes it from the L4 VIP, which `unnat` ensures (2.1,
+point 5). That is the lab-validated path.
 
 The opposite case is **not** supported: an L4 backend that is itself the pod of
 a VM-mode service. Its replies would be source-rewritten at `raw` before

@@ -15,10 +15,19 @@ table ip cozy_proxy_l4 {
 		type ipv4_addr . inet_proto . inet_service
 	}
 
+	map vip_by_mark {
+		type mark : ipv4_addr
+	}
+
 	chain guard {
 		type filter hook prerouting priority mangle + 10; policy accept;
 		ct state established,related accept
 		ip daddr @vips ip daddr . meta l4proto . th dport != @vip_ports drop
+	}
+
+	chain unnat {
+		type filter hook prerouting priority -139; policy accept;
+		ct direction reply ct status & (snat | dnat) == dnat ip saddr set ct mark map @vip_by_mark
 	}
 
 	chain translate {
