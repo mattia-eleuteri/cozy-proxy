@@ -26,6 +26,13 @@ table ip cozy_proxy_l4 {
 			     10.244.0.11 . tcp . 8443 }
 	}
 
+	map vip_by_mark {
+		type mark : ipv4_addr
+		elements = { 0xc000020a : 192.0.2.10,
+			     0xc0000214 : 192.0.2.20,
+			     0xc000021e : 192.0.2.30 }
+	}
+
 	map backends-192.0.2.10-tcp-80 {
 		type 0 : ipv4_addr . inet_service
 		comment "tenant-a/ingress"
@@ -46,10 +53,15 @@ table ip cozy_proxy_l4 {
 		ip daddr @vips ip daddr . meta l4proto . th dport != @vip_ports drop
 	}
 
+	chain unnat {
+		type filter hook prerouting priority -139; policy accept;
+		ct direction reply ct status & (snat | dnat) == dnat ip saddr set ct mark map @vip_by_mark
+	}
+
 	chain translate {
 		type nat hook prerouting priority dstnat - 5; policy accept;
-		ip daddr 192.0.2.10 tcp dport 80 dnat ip to numgen inc mod 2 map @backends-192.0.2.10-tcp-80 comment "tenant-a/ingress"
-		ip daddr 192.0.2.10 tcp dport 443 dnat ip to numgen inc mod 2 map @backends-192.0.2.10-tcp-443 comment "tenant-a/ingress"
+		ip daddr 192.0.2.10 tcp dport 80 ct mark set 0xc000020a dnat ip to numgen inc mod 2 map @backends-192.0.2.10-tcp-80 comment "tenant-a/ingress"
+		ip daddr 192.0.2.10 tcp dport 443 ct mark set 0xc000020a dnat ip to numgen inc mod 2 map @backends-192.0.2.10-tcp-443 comment "tenant-a/ingress"
 		ip daddr 192.0.2.20 tcp dport 5432 drop comment "tenant-b/postgres"
 	}
 

@@ -27,15 +27,33 @@ var (
 	// After conntrack (-200) and the VM mode's ingress_dnat (-150), before
 	// the DNAT below.
 	l4GuardPriority = nftables.ChainPriorityRef(*nftables.ChainPriorityMangle + 10)
+	// After conntrack and before the routing decision, which follows the
+	// prerouting hooks.
+	l4UnnatPriority = nftables.ChainPriorityRef(*nftables.ChainPriorityMangle + 11)
 	// Just before the iptables / kube-ovn nat hooks (-100), which then see the
 	// translated packet.
 	l4DNATPriority = nftables.ChainPriorityRef(*nftables.ChainPriorityNATDest - 5)
 	l4MasqPriority = nftables.ChainPriorityRef(*nftables.ChainPriorityNATSource - 5)
 )
 
-// ipsDstNAT is IPS_DST_NAT from linux/netfilter/nf_conntrack_common.h: the
-// conntrack status bit set once a flow has been destination-NATed.
-const ipsDstNAT = 1 << 5
+// ipsSrcNAT and ipsDstNAT are IPS_SRC_NAT and IPS_DST_NAT from
+// linux/netfilter/nf_conntrack_common.h: the conntrack status bits set once a
+// flow has been source- or destination-NATed.
+const (
+	ipsSrcNAT = 1 << 4
+	ipsDstNAT = 1 << 5
+)
+
+// ctDirReply is IP_CT_DIR_REPLY, what "ct direction" loads for a reply.
+const ctDirReply = 1
+
+// vipMark is the conntrack mark the translate chain gives a flow to VIP: the
+// address itself, read as a big-endian integer, so nft and conntrack -L show
+// 192.0.2.10 as 0xc000020a.
+func vipMark(vip netip.Addr) []byte {
+	ip := vip.As4()
+	return binaryutil.NativeEndian.PutUint32(binaryutil.BigEndian.Uint32(ip[:]))
+}
 
 // NFTL4Datapath programs the L4 mode's table with nftables.
 //
@@ -104,12 +122,15 @@ func (d *NFTL4Datapath) Teardown() error {
 //	set node_ips  { type ipv4_addr }                                  masqueraded sources
 //	set backends  { type ipv4_addr . inet_proto . inet_service }      local targets, announcer
 //	map backends-<vip>-<proto>-<port> { type integer : ipv4_addr . inet_service }
+//	map vip_by_mark { type mark : ipv4_addr }                         every VIP, keyed by vipMark
 //
 //	chain guard  filter prerouting mangle+10
 //	  ct state established,related accept
 //	  ip daddr @vips ip daddr . meta l4proto . th dport != @vip_ports drop
+//	chain unnat  filter prerouting mangle+11
+//	  ct direction reply ct status & (snat|dnat) == dnat ip saddr set ct mark map @vip_by_mark
 //	chain translate  nat prerouting dstnat-5  (rules on the announcer only)
-//	  ip daddr V tcp dport P dnat ip addr . port to numgen inc mod N map @backends-...
+//	  ip daddr V tcp dport P ct mark set vipMark(V) dnat ip addr . port to numgen inc mod N map @backends-...
 //	  ip daddr V tcp dport P drop             (announced port with no local backend)
 //	chain masq   nat postrouting srcnat-5
 //	  ct status dnat ip saddr @node_ips ip daddr . meta l4proto . th dport @backends masquerade fully-random
@@ -188,6 +209,75 @@ func buildL4Table(conn *nftables.Conn, t *nftables.Table, st l4.State) error {
 		&expr.Verdict{Kind: expr.VerdictDrop},
 	}})
 
+	// The VIP of every flow, keyed by the mark the translate chain gives it.
+	vipByMark := &nftables.Set{
+		Table:    t,
+		ID:       ids.next(),
+		Name:     "vip_by_mark",
+		IsMap:    true,
+		KeyType:  nftables.TypeMark,
+		DataType: nftables.TypeIPAddr,
+		// Marks are host-endian: without this, nft lists the keys byte-swapped
+		// and they no longer read as the "ct mark set" values of translate.
+		KeyByteOrder: binaryutil.NativeEndian,
+	}
+	markElems := make([]nftables.SetElement, 0, len(st.VIPs))
+	for _, vip := range st.VIPs {
+		ip := vip.As4()
+		markElems = append(markElems, nftables.SetElement{Key: vipMark(vip), Val: ip[:]})
+	}
+	if err := conn.AddSet(vipByMark, markElems); err != nil {
+		return fmt.Errorf("could not add map %s: %w", vipByMark.Name, err)
+	}
+
+	// Conntrack gives a reply its VIP source back only in postrouting, after
+	// the node has routed it. Routed with the backend's address as source, the
+	// reply to a client that was not masqueraded — a VM's public IP, the
+	// Internet — misses the source rules that send the VIP pool's traffic to
+	// its own uplink, and leaves through the node's default gateway. A client
+	// on the same L2 then gets the SYN-ACK from a router that never saw its
+	// SYN, and a stateful one drops it: the connection never opens. Writing
+	// the VIP back before routing makes the reply leave the way traffic from
+	// the VIP does, as it did under Cilium, which reverses the translation
+	// before the route lookup. The VM mode does the same for its addresses in
+	// egress_snat. Conntrack still applies its own translation in postrouting,
+	// which finds the source already in place.
+	//
+	// Masqueraded flows are left alone: their reply goes to a node, which the
+	// VIP's routes do not reach.
+	unnat := conn.AddChain(&nftables.Chain{
+		Name:     "unnat",
+		Table:    t,
+		Type:     nftables.ChainTypeFilter,
+		Hooknum:  nftables.ChainHookPrerouting,
+		Priority: l4UnnatPriority,
+	})
+	conn.AddRule(&nftables.Rule{Table: t, Chain: unnat, Exprs: []expr.Any{
+		&expr.Ct{Register: 1, Key: expr.CtKeyDIRECTION},
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{ctDirReply}},
+		&expr.Ct{Register: 1, Key: expr.CtKeySTATUS},
+		&expr.Bitwise{
+			SourceRegister: 1,
+			DestRegister:   1,
+			Len:            4,
+			Mask:           binaryutil.NativeEndian.PutUint32(ipsSrcNAT | ipsDstNAT),
+			Xor:            binaryutil.NativeEndian.PutUint32(0),
+		},
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: binaryutil.NativeEndian.PutUint32(ipsDstNAT)},
+		&expr.Ct{Register: 1, Key: expr.CtKeyMARK},
+		&expr.Lookup{SourceRegister: 1, DestRegister: 1, IsDestRegSet: true, SetName: vipByMark.Name, SetID: vipByMark.ID},
+		&expr.Payload{
+			OperationType:  expr.PayloadWrite,
+			SourceRegister: 1,
+			Base:           expr.PayloadBaseNetworkHeader,
+			Offset:         12,
+			Len:            4,
+			CsumType:       expr.CsumTypeInet,
+			CsumOffset:     10,
+			CsumFlags:      unix.NFT_PAYLOAD_L4CSUM_PSEUDOHDR,
+		},
+	}})
+
 	// Not "dnat": nft takes that for its keyword, and an operator could not
 	// name the chain on the command line without quoting it.
 	translate := conn.AddChain(&nftables.Chain{
@@ -209,6 +299,11 @@ func buildL4Table(conn *nftables.Conn, t *nftables.Table, st l4.State) error {
 				return err
 			}
 			exprs = append(exprs,
+				// Mark the flow with its VIP for the unnat chain. It must be
+				// set here, before the translation: once a chain has NATed
+				// the flow, the hook skips every later nat chain.
+				&expr.Immediate{Register: 1, Data: vipMark(r.VIP)},
+				&expr.Ct{Register: 1, SourceRegister: true, Key: expr.CtKeyMARK},
 				// Round-robin slot, then slot -> (address . port) into
 				// NFT_REG32_00 and NFT_REG32_01, which the NAT reads.
 				&expr.Numgen{Register: 1, Modulus: uint32(len(r.Backends)), Type: unix.NFT_NG_INCREMENTAL},

@@ -15,6 +15,7 @@ import (
 
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
+	"golang.org/x/sys/unix"
 	v1 "k8s.io/api/core/v1"
 
 	"github.com/cozystack/cozy-proxy/pkg/l4"
@@ -237,6 +238,50 @@ func TestL4DatapathMasqueradesNodeSources(t *testing.T) {
 	}
 	if ans.seenSource != a(routerToSrv) {
 		t.Errorf("backend saw %s, want the announcer's address %s", ans.seenSource, routerToSrv)
+	}
+}
+
+// A Hikube node routes by source: traffic from the VIP pool leaves through
+// the pool's own uplink, everything else through the node's default gateway.
+// The reply to a client that is not masqueraded — a VM's public IP — must
+// take the VIP's route, as it does for a VM. Here the router reaches the
+// client only through the VIP's table; its main table drops it, as the
+// stateful gateway drops a SYN-ACK whose SYN it never saw.
+func TestL4DatapathRoutesRepliesFromTheVIP(t *testing.T) {
+	tp := newTopology(t)
+	serve(t, tp.server)
+
+	h, err := netlink.NewHandleAt(tp.router)
+	must(t, "netlink.NewHandleAt", err)
+	defer h.Close()
+	rc, err := h.LinkByName("rc")
+	must(t, "rc", err)
+	clientNet := mustAddr(t, "10.0.1.0/24").IPNet
+	connected, err := h.RouteListFiltered(netlink.FAMILY_V4,
+		&netlink.Route{LinkIndex: rc.Attrs().Index, Dst: clientNet}, netlink.RT_FILTER_OIF|netlink.RT_FILTER_DST)
+	must(t, "list connected route", err)
+	if len(connected) != 1 {
+		t.Fatalf("want one connected route to the client, got %v", connected)
+	}
+	must(t, "del connected route", h.RouteDel(&connected[0]))
+	must(t, "blackhole in main", h.RouteAdd(&netlink.Route{Dst: clientNet, Type: unix.RTN_BLACKHOLE}))
+	const vipTable = 100
+	must(t, "route in the VIP table", h.RouteAdd(&netlink.Route{
+		LinkIndex: rc.Attrs().Index, Dst: clientNet, Table: vipTable, Scope: netlink.SCOPE_LINK,
+	}))
+	rule := netlink.NewRule()
+	rule.Src = mustAddr(t, testVIP+"/32").IPNet
+	rule.Table = vipTable
+	rule.Priority = 100
+	must(t, "source rule", h.RuleAdd(rule))
+
+	must(t, "Sync", datapathIn(tp.router).Sync(routerState()))
+	ans, err := dial(t, tp.client, testVIP+":80")
+	if err != nil {
+		t.Fatalf("the reply must leave by the VIP's route: %v", err)
+	}
+	if ans.seenSource != a(clientAddr) {
+		t.Errorf("backend saw %s, want the client's own address %s", ans.seenSource, clientAddr)
 	}
 }
 

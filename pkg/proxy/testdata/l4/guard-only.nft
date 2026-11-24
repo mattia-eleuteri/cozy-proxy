@@ -22,10 +22,22 @@ table ip cozy_proxy_l4 {
 		type ipv4_addr . inet_proto . inet_service
 	}
 
+	map vip_by_mark {
+		type mark : ipv4_addr
+		elements = { 0xc000020a : 192.0.2.10,
+			     0xc0000214 : 192.0.2.20,
+			     0xc000021e : 192.0.2.30 }
+	}
+
 	chain guard {
 		type filter hook prerouting priority mangle + 10; policy accept;
 		ct state established,related accept
 		ip daddr @vips ip daddr . meta l4proto . th dport != @vip_ports drop
+	}
+
+	chain unnat {
+		type filter hook prerouting priority -139; policy accept;
+		ct direction reply ct status & (snat | dnat) == dnat ip saddr set ct mark map @vip_by_mark
 	}
 
 	chain translate {
