@@ -81,5 +81,11 @@ func Classify(svc *v1.Service) (Selection, string) {
 	if svc.Spec.ExternalTrafficPolicy != v1.ServiceExternalTrafficPolicyLocal {
 		return Unsupported, "externalTrafficPolicy must be Local"
 	}
+	// Cilium enforces loadBalancerSourceRanges on the frontend the annotation
+	// removes. Programming the VIP would drop the owner's restriction, so the
+	// service is refused and stays with Cilium once the annotation goes.
+	if len(svc.Spec.LoadBalancerSourceRanges) > 0 {
+		return Unsupported, "loadBalancerSourceRanges is not enforced by the L4 mode"
+	}
 	return Managed, ""
 }

@@ -109,7 +109,8 @@ connections to its local ready backends, masquerading only sources that are
 node IPs; everything else addressed to the VIP is dropped. The mode has its own table, `ip
 cozy_proxy_l4`, and never touches the VM mode's. It is off by default: run with
 `--enable-l4-loadbalancer` (chart value `l4LoadBalancer.enabled`). Phase 1
-handles TCP, IPv4 and `externalTrafficPolicy: Local`.
+handles TCP, IPv4 and `externalTrafficPolicy: Local`; a service with
+`loadBalancerSourceRanges` is refused, since the mode does not enforce them.
 
 See [the RFC](docs/rfc/l4-loadbalancer-mode.md) for the model, the datapath,
 the security implications and the rollout plan.

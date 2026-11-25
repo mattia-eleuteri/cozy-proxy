@@ -52,6 +52,10 @@ func TestClassify(t *testing.T) {
 			s.Spec.ExternalTrafficPolicy = v1.ServiceExternalTrafficPolicyCluster
 		}, Unsupported},
 		{"eTP unset defaults to Cluster", func(s *v1.Service) { s.Spec.ExternalTrafficPolicy = "" }, Unsupported},
+		// Programming it would lift the owner's source restriction.
+		{"loadBalancerSourceRanges set", func(s *v1.Service) {
+			s.Spec.LoadBalancerSourceRanges = []string{"198.51.100.0/24"}
+		}, Unsupported},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

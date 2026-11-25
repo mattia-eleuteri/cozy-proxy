@@ -192,9 +192,11 @@ there.
 | Ports / backends | many / many | |
 | Endpoints | EndpointSlices, ready, local | terminating fallback |
 | Announcer source | MetalLB L2 `ServiceL2Status`, or a local ready backend (BGP) | other LB providers |
+| `loadBalancerSourceRanges` | refused (see 6.1) | enforced in the guard, if asked for |
 
 A labelled and annotated service that is not supported (for example
-`externalTrafficPolicy: Cluster`) is **not** programmed, but its VIP is still
+`externalTrafficPolicy: Cluster`, or `loadBalancerSourceRanges` set) is **not**
+programmed, but its VIP is still
 added to the guard, so its traffic is dropped instead of looping. A port the
 phase does not support (UDP) is likewise left out of the declared ports, so the
 guard drops it.
@@ -473,6 +475,16 @@ In production today, all Postgres and Ingress services and most CCM services use
 `Local`. MariaDB (`Cluster` by default in the operator) and a minority of tenant
 Kubernetes services (the CCM copies the tenant's policy) use `Cluster`.
 
+### 6.1 `loadBalancerSourceRanges`
+
+Cilium enforces `loadBalancerSourceRanges` on the LoadBalancer frontend, which
+`service.cilium.io/type: ClusterIP` removes. Programming such a service would
+drop the owner's restriction, so cozy-proxy refuses it like eTP `Cluster`: the
+VIP is guarded, its traffic dropped, and the reason logged. The platform does
+not opt such a service in; if one is labelled anyway, removing the annotation
+hands it back to Cilium, which enforces the ranges again. Enforcing them in the
+guard (a per-VIP set of allowed sources) is left to a later phase.
+
 ## 7. Opting services in, per type
 
 All of this is on the Cozystack side; cozy-proxy only reacts to the label and
@@ -483,7 +495,7 @@ enabled per environment.
 |---|---|---|
 | Postgres | `packages/apps/postgres/templates/external-svc.yaml` | add the label and the annotation; eTP is already `Local` |
 | MariaDB | `packages/apps/mariadb/templates/mariadb.yaml` (`spec.service` / `spec.primaryService`) | add the label and the annotation through the operator's service template, and set `externalTrafficPolicy: Local` (operator default is `Cluster`) |
-| Tenant Kubernetes (CCM) | CCM patch, next to the existing ones in `packages/apps/kubernetes/images/kubevirt-cloud-provider/patches`, switched on from `packages/apps/kubernetes/templates/cloud-config.yaml` | The CCM itself sets the label and `service.cilium.io/type: ClusterIP`, overriding any value copied from the tenant, and only when the tenant Service is eTP `Local`. `infraLabels` alone is not enough: it labels every Service of the cluster, eTP `Cluster` ones included, and the annotation would still have to come from the tenant. The CCM only sets labels and annotations at creation, so existing infra Services need a one-shot patch. See 7.1 for the Kyverno guard. |
+| Tenant Kubernetes (CCM) | CCM patch, next to the existing ones in `packages/apps/kubernetes/images/kubevirt-cloud-provider/patches`, switched on from `packages/apps/kubernetes/templates/cloud-config.yaml` | The CCM itself sets the label and `service.cilium.io/type: ClusterIP`, overriding any value copied from the tenant, and only when the tenant Service is eTP `Local` without `loadBalancerSourceRanges` (6.1). `infraLabels` alone is not enough: it labels every Service of the cluster, eTP `Cluster` ones included, and the annotation would still have to come from the tenant. The CCM only sets labels and annotations at creation, so existing infra Services need a one-shot patch. See 7.1 for the Kyverno guard. |
 | Ingress | `packages/extra/ingress/templates/nginx-ingress.yaml` | `controller.service.labels` / `annotations`; eTP is already `Local`. The host ingress (`tenant-root`) with PROXY protocol and ouroboros is last, see Open questions. |
 | cozy-proxy | `packages/system/cozy-proxy` | bump the vendored chart, enable the mode, extend RBAC (EndpointSlices, Nodes, ServiceL2Status) |
 
@@ -697,8 +709,8 @@ docker run --rm --privileged -v "$PWD":/src -w /src golang:1.26 sh -c \
   'apt-get update -qq && apt-get install -y -qq nftables && go test ./...'
 ```
 
-Not in phase 1: UDP, eTP `Cluster`, IPv6, terminating endpoints, metrics and
-Events.
+Not in phase 1: UDP, eTP `Cluster`, `loadBalancerSourceRanges`, IPv6,
+terminating endpoints, metrics and Events.
 
 Lab run on 2026-10-02 (image built from `181b41c`, as a second release with the
 VM mode off, next to the platform's cozy-proxy):
